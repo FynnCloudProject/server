@@ -1,0 +1,16 @@
+Packages
+.build/
+xcuserdata
+DerivedData/
+*.xcodeproj
+.swiftpm
+.index-build
+.DS_Store
+
+
+Storage/
+db.sqlite
+
+.env
+.env.*
+
