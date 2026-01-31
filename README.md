@@ -8,11 +8,11 @@ A high-performance, self-hosted cloud storage solution powered by **Swift** and 
 
 ---
 
-> [!WARNING] ⚠️ Development Status: Early Alpha
-> This project is in an **early development stage**. 
-> * **Database Schema:** Subject to change without migrations.
-> * **API:** Breaking changes may occur on any commit.
-> * **Stability:** Not recommended for production data yet.
+## ⚠️ Development Status: Early Alpha
+This project is in an **early development stage**. 
+* **Database Schema:** Subject to change without migrations.
+* **API:** Breaking changes may occur on any commit.
+* **Stability:** Not recommended for production data yet.
 
 ---
 
@@ -47,7 +47,7 @@ swift run FynnCloudBackend
 1. Ensure you have **Swift 6.0+** installed.
 2. Clone the repository:
 ```bash
-git clone [https://github.com/thilojaeggi/FynnCloudBackend.git](https://github.com/thilojaeggi/FynnCloudBackend.git)
+git clone https://github.com/thilojaeggi/FynnCloudBackend.git
 cd FynnCloudBackend
 ```
 
@@ -57,7 +57,7 @@ cd FynnCloudBackend
 swift build
 ```
 
-4. Run the project:
+4. Run the binary:
 ```bash
-swift run FynnCloudBackend
+./build/debug/FynnCloudBackend
 ```
