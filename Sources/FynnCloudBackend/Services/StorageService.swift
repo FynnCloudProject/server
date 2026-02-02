@@ -21,7 +21,7 @@ struct StorageService: Sendable {
         on transaction: any Database
     ) async throws {
         let maxRetries = 3
-        var lastError: Error?
+        var lastError: (any Error)?
 
         for attempt in 1...maxRetries {
             // Fetch the current highest sequence for this user
