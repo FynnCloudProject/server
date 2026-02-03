@@ -30,7 +30,8 @@ struct UserPayload: JWTPayload, Authenticatable {
 
     func getID() throws -> UUID {
         guard let uuid = UUID(uuidString: subject.value) else {
-            throw Abort(.badRequest, reason: "Invalid subject claim")
+            throw Abort(.badRequest, reason: "Invalid subject claim").localized(
+                "error.unauthorized")
         }
         return uuid
     }
