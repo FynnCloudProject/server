@@ -5,8 +5,13 @@ extension Request {
     var storage: StorageService {
         let provider: any FileStorageProvider
 
-        switch application.storageConfig.driver {
-        case .local(let path):  // Extract the configured path
+        guard let config = application.storageConfig else {
+            fatalError(
+                "StorageConfiguration not initialized. Set app.storageConfig in configure.swift")
+        }
+
+        switch config.driver {
+        case .local(let path):
             provider = LocalFileSystemProvider(
                 storageDirectory: path
             )
@@ -15,8 +20,8 @@ extension Request {
             provider = S3StorageProvider(
                 s3: S3(
                     client: application.aws,
-                    region: .init(awsRegionName: Environment.get("AWS_REGION") ?? "us-east-1"),
-                    endpoint: Environment.get("AWS_ENDPOINT") ?? "https://s3.amazonaws.com",
+                    region: .init(awsRegionName: application.config.awsRegion),
+                    endpoint: application.config.awsEndpoint,
 
                 ),
                 bucket: bucket,
