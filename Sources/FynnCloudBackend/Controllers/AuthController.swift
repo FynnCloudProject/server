@@ -39,7 +39,8 @@ struct AuthController: RouteCollection {
                 .filter(\.$username == loginData.username)
                 .first()
         else {
-            throw Abort(.unauthorized, reason: "Invalid credentials")
+            throw Abort(.unauthorized, reason: "Invalid credentials").localized(
+                "auth.login.error.invalidCredentials")
         }
 
         let grant = OAuthGrant(
@@ -64,11 +65,12 @@ struct AuthController: RouteCollection {
                 .first(),
             try user.verify(password: loginData.password)
         else {
-            throw Abort(.unauthorized, reason: "Invalid credentials")
+            throw Abort(.unauthorized, reason: "Invalid credentials").localized(
+                "auth.login.error.invalidCredentials")
         }
 
         // Only allow specific redirect URIs
-        let frontendURL = Environment.get("FRONTEND_URL") ?? "http://localhost"
+        let frontendURL = req.application.config.frontendURL
         let allowedURIs = [
             "fynncloud://auth",
             "\(frontendURL)/auth/callback",
@@ -76,7 +78,7 @@ struct AuthController: RouteCollection {
 
         let targetURI = loginData.redirectURI ?? "\(frontendURL)/auth/callback"
         guard allowedURIs.contains(targetURI) else {
-            throw Abort(.badRequest, reason: "Unauthorized redirect URI")
+            throw Abort(.badRequest, reason: "Unauthorized redirect URI").localized("error.generic")
         }
 
         // Create the One-Time OAuth Code
@@ -100,7 +102,7 @@ struct AuthController: RouteCollection {
         components?.queryItems = queryItems
 
         guard let finalURL = components?.string else {
-            throw Abort(.internalServerError)
+            throw Abort(.internalServerError).localized("error.generic")
         }
 
         // Return both for flexibility (Web can use code directly, Apps might use callbackURL if needed)
@@ -119,16 +121,19 @@ struct AuthController: RouteCollection {
                 .first(),
             oauthCode.expiresAt > Date()
         else {
-            throw Abort(.unauthorized, reason: "Code expired or invalid")
+            throw Abort(.unauthorized, reason: "Code expired or invalid").localized(
+                "auth.callback.error.exchangeFailed")
         }
 
         let hashedVerifier = SHA256.hash(data: Data(dto.code_verifier.utf8)).base64URLEncoded()
         guard hashedVerifier == oauthCode.codeChallenge else {
-            throw Abort(.unauthorized, reason: "Invalid verifier")
+            throw Abort(.unauthorized, reason: "Invalid verifier").localized(
+                "auth.callback.error.exchangeFailed")
         }
 
         guard dto.clientId == oauthCode.clientID else {
-            throw Abort(.unauthorized, reason: "Client ID mismatch")
+            throw Abort(.unauthorized, reason: "Client ID mismatch").localized(
+                "auth.authorize.error.invalidClientId")
         }
 
         let user = oauthCode.user
@@ -159,7 +164,8 @@ struct AuthController: RouteCollection {
         if isWeb {
             setAuthCookies(
                 response: response, accessToken: loginResponse.accessToken,
-                refreshToken: loginResponse.refreshToken)
+                refreshToken: loginResponse.refreshToken,
+                isProduction: req.application.environment == .production)
         }
 
         return response
@@ -173,14 +179,16 @@ struct AuthController: RouteCollection {
         } else if let dto = try? req.content.decode(RefreshDTO.self) {
             refreshToken = dto.refreshToken
         } else {
-            throw Abort(.unauthorized, reason: "No refresh token found")
+            throw Abort(.unauthorized, reason: "No refresh token found").localized(
+                "error.unauthorized")
         }
 
         let payload = try await req.jwt.verify(refreshToken, as: UserPayload.self)
 
         // Fetch the grant
         guard let grant = try await OAuthGrant.find(payload.grantID, on: req.db) else {
-            throw Abort(.unauthorized, reason: "Session revoked")
+            throw Abort(.unauthorized, reason: "Session revoked").localized(
+                "error.unauthorized")
         }
 
         // Check if the token is the current refresh token based on the jti to prevent reuse attacks
@@ -188,10 +196,12 @@ struct AuthController: RouteCollection {
             // Revoke the whole session (grant) to be safe on reuse of a refresh token
             try await grant.delete(on: req.db)
             throw Abort(.unauthorized, reason: "Token reuse detected. Session terminated.")
+                .localized(
+                    "error.unauthorized")
         }
 
         guard let user = try await User.find(grant.$user.id, on: req.db) else {
-            throw Abort(.unauthorized)
+            throw Abort(.unauthorized).localized("error.unauthorized")
         }
 
         // Generate new tokens
@@ -208,7 +218,8 @@ struct AuthController: RouteCollection {
         if isWeb {
             setAuthCookies(
                 response: response, accessToken: loginResponse.accessToken,
-                refreshToken: loginResponse.refreshToken)
+                refreshToken: loginResponse.refreshToken,
+                isProduction: req.application.environment == .production)
         }
 
         return response
@@ -252,8 +263,9 @@ struct AuthController: RouteCollection {
 
     // MARK: - Cookie Helpers
 
-    private func setAuthCookies(response: Response, accessToken: String, refreshToken: String) {
-        let isProduction = Environment.get("ENVIRONMENT") == "production"
+    private func setAuthCookies(
+        response: Response, accessToken: String, refreshToken: String, isProduction: Bool
+    ) {
         let refreshDuration: TimeInterval = 604800
 
         // Access Token Cookie (15 minutes)
@@ -281,7 +293,7 @@ struct AuthController: RouteCollection {
         )
     }
 
-    private func clearAuthCookies(response: Response) {
+    private func clearAuthCookies(response: Response, isProduction: Bool) {
         // Clear cookies by setting them to expire immediately
         response.cookies["accessToken"] = HTTPCookies.Value(
             string: "",
@@ -289,7 +301,7 @@ struct AuthController: RouteCollection {
             maxAge: 0,
             domain: nil,
             path: "/",
-            isSecure: Environment.get("ENVIRONMENT") == "production",
+            isSecure: isProduction,
             isHTTPOnly: true,
             sameSite: .lax
         )
@@ -300,7 +312,7 @@ struct AuthController: RouteCollection {
             maxAge: 0,
             domain: nil,
             path: "/",
-            isSecure: Environment.get("ENVIRONMENT") == "production",
+            isSecure: isProduction,
             isHTTPOnly: true,
             sameSite: .lax
         )
@@ -318,7 +330,8 @@ struct AuthController: RouteCollection {
 
         // Create response and clear cookies
         let response = Response(status: .ok)
-        clearAuthCookies(response: response)
+        clearAuthCookies(
+            response: response, isProduction: req.application.environment == .production)
 
         return response
     }
@@ -326,7 +339,7 @@ struct AuthController: RouteCollection {
     func listSessions(req: Request) async throws -> [OAuthGrant] {
         let payload = try req.auth.require(UserPayload.self)
         guard let userID = UUID(uuidString: payload.subject.value) else {
-            throw Abort(.unauthorized)
+            throw Abort(.unauthorized).localized("error.unauthorized")
         }
 
         return try await OAuthGrant.query(on: req.db)
@@ -337,10 +350,10 @@ struct AuthController: RouteCollection {
     func revokeSession(req: Request) async throws -> HTTPStatus {
         let payload = try req.auth.require(UserPayload.self)
         guard let userID = UUID(uuidString: payload.subject.value) else {
-            throw Abort(.unauthorized)
+            throw Abort(.unauthorized).localized("error.unauthorized")
         }
         guard let targetGrantID = req.parameters.get("grantID", as: UUID.self) else {
-            throw Abort(.badRequest)
+            throw Abort(.badRequest).localized("auth.authorize.error.missingParams")
         }
 
         // Ensure the user owns the grant they are trying to revoke
@@ -357,14 +370,31 @@ struct AuthController: RouteCollection {
     func register(req: Request) async throws -> User.Public {
         let registerData = try req.content.decode(RegisterDTO.self)
         if registerData.password != registerData.confirmPassword {
-            throw Abort(.badRequest, reason: "Passwords do not match")
+            throw Abort(.badRequest, reason: "Passwords do not match").localized(
+                "auth.register.error.passwordMismatch")
+        }
+
+        // Check availability
+        if try await User.query(on: req.db).filter(\.$username == registerData.username).first()
+            != nil
+        {
+            throw Abort(.conflict, reason: "Username is already taken").localized(
+                "auth.register.error.usernameExists")
+        }
+
+        if try await User.query(on: req.db).filter(\.$email == registerData.email).first() != nil {
+            throw Abort(.conflict, reason: "Email is already registered").localized(
+                "auth.register.error.emailExists")
         }
 
         let passwordHash = try Bcrypt.hash(registerData.password)
         guard
             let freeTier = try await StorageTier.query(on: req.db).filter(\.$name == "Free").first()
         else {
-            throw Abort(.internalServerError, reason: "Storage tier not found")
+            throw Abort(
+                .internalServerError,
+                reason: "Storage tier configuration error. Please contact support."
+            ).localized("error.generic")
         }
 
         let user = User(
@@ -377,7 +407,7 @@ struct AuthController: RouteCollection {
     func authorizePost(req: Request) async throws -> AuthorizeResponse {
         let payload = try req.auth.require(UserPayload.self)
         guard let userID = UUID(uuidString: payload.subject.value) else {
-            throw Abort(.unauthorized)
+            throw Abort(.unauthorized).localized("error.unauthorized")
         }
         let dto = try req.content.decode(AuthorizeDTO.self)
 
@@ -391,12 +421,12 @@ struct AuthController: RouteCollection {
         try await oauthCode.save(on: req.db)
 
         let allowedURIs = [
-            "fynncloud://auth", "\(Environment.get("FRONTEND_URL") ?? "")/auth/callback",
+            "fynncloud://auth", "\(req.application.config.frontendURL)/auth/callback",
         ]
         let baseCallback = dto.redirectURI ?? "fynncloud://auth"
 
         guard allowedURIs.contains(baseCallback) else {
-            throw Abort(.badRequest, reason: "Unauthorized redirect URI")
+            throw Abort(.badRequest, reason: "Unauthorized redirect URI").localized("error.generic")
         }
 
         var components = URLComponents(string: baseCallback)
