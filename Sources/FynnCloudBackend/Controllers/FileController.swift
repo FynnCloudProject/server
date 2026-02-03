@@ -18,6 +18,12 @@ struct FileController: RouteCollection {
         // Upload
         protected.on(.PUT, body: .stream, use: upload)
         protected.on(.PUT, ":fileID", body: .stream, use: update)
+        protected.post("multipart", "initiate", use: initiateMultipartUpload)
+        protected.on(
+            .PUT, "multipart", ":sessionID", "part", ":partNumber", body: .stream, use: uploadPart)
+        protected.post("multipart", ":sessionID", "complete", use: completeMultipartUpload)
+        protected.delete("multipart", ":sessionID", "abort", use: abortMultipartUpload)
+        protected.get("multipart", ":sessionID", "status", use: getUploadStatus)
 
         // Directory operations
         protected.post("create-directory", use: createDirectory)
@@ -92,18 +98,16 @@ struct FileController: RouteCollection {
     func upload(req: Request) async throws -> FileMetadata {
         let userID = try req.auth.require(UserPayload.self).getID()
 
-        req.logger.info("Upload request query : \(req.url.query)")
-
         guard let contentLength = req.headers.first(name: .contentLength).flatMap(Int64.init),
             contentLength > 0
         else {
-            throw Abort(.lengthRequired)
+            throw Abort(.lengthRequired).localized("upload.error.unknown")
         }
 
         let metadata = try await req.storage.upload(
             filename: req.query[String.self, at: "filename"] ?? "unnamed",
             stream: req.body,
-            size: contentLength,
+            claimedSize: contentLength,
             contentType: req.query[String.self, at: "contentType"] ?? "application/octet-stream",
             parentID: try? req.query.get(UUID.self, at: "parentID"),
             userID: userID,
@@ -142,13 +146,14 @@ struct FileController: RouteCollection {
             let contentType = req.query[String.self, at: "contentType"],
             let lastModified = req.query[Int64.self, at: "lastModified"]
         else {
-            throw Abort(.badRequest, reason: "Missing required query parameters")
+            throw Abort(.badRequest, reason: "Missing required query parameters").localized(
+                "upload.error.unknown")
         }
 
         let metadata = try await req.storage.update(
             fileID: fileID,
             stream: req.body,
-            newSize: size,
+            claimedSize: size,
             contentType: contentType,
             userID: userID,
             lastModified: lastModified
@@ -243,7 +248,7 @@ struct FileController: RouteCollection {
 
         guard let fileID = req.parameters.get("fileID", as: UUID.self)
         else {
-            throw Abort(.notFound)
+            throw Abort(.notFound).localized("files.alerts.restoreFailed")
         }
 
         return try await req.storage.restore(fileID: fileID, userID: userID)
@@ -258,7 +263,7 @@ struct FileController: RouteCollection {
                 .filter(\.$owner.$id == userID)
                 .first()
         else {
-            throw Abort(.notFound)
+            throw Abort(.notFound).localized("error.generic")
         }
 
         // Check for specific value in body if we want to set true/false explicitly
@@ -284,4 +289,157 @@ struct FileController: RouteCollection {
         return file
     }
 
+    // MARK: - Multipart Upload Handlers
+
+    func initiateMultipartUpload(req: Request) async throws -> InitiateMultipartResponse {
+        let userID = try req.auth.require(UserPayload.self).getID()
+        let input = try req.content.decode(InitiateMultipartInput.self)
+
+        let session = try await req.storage.initiateMultipartUpload(
+            filename: input.filename,
+            contentType: input.contentType,
+            totalSize: input.totalSize,
+            parentID: input.parentID,
+            lastModified: input.lastModified,
+            userID: userID,
+            request: req
+        )
+
+        req.logger.info(
+            "Multipart upload initiated",
+            metadata: [
+                "sessionID": .string(session.id?.uuidString ?? ""),
+                "filename": .string(input.filename),
+                "size": .string("\(input.totalSize)"),
+            ]
+        )
+
+        return InitiateMultipartResponse(
+            sessionID: session.id!,
+            fileID: session.fileID,
+            uploadID: session.uploadID,
+            maxChunkSize: session.maxChunkSize
+        )
+    }
+
+    func uploadPart(req: Request) async throws -> UploadPartResponse {
+        let userID = try req.auth.require(UserPayload.self).getID()
+        let sessionID = try req.parameters.require("sessionID", as: UUID.self)
+        let partNumber = try req.parameters.require("partNumber", as: Int.self)
+
+        guard let contentLength = req.headers.first(name: .contentLength).flatMap(Int64.init),
+            contentLength > 0
+        else {
+            throw Abort(.lengthRequired, reason: "Content-Length header required")
+        }
+
+        let completedPart = try await req.storage.uploadPart(
+            sessionID: sessionID,
+            partNumber: partNumber,
+            stream: req.body,
+            size: contentLength
+        )
+
+        req.logger.info(
+            "Part uploaded",
+            metadata: [
+                "sessionID": .string(sessionID.uuidString),
+                "partNumber": .string("\(partNumber)"),
+                "size": .string("\(contentLength)"),
+            ]
+        )
+
+        return UploadPartResponse(
+            partNumber: completedPart.partNumber,
+            etag: completedPart.etag
+        )
+    }
+
+    func completeMultipartUpload(req: Request) async throws -> FileMetadata {
+        let userID = try req.auth.require(UserPayload.self).getID()
+        let sessionID = try req.parameters.require("sessionID", as: UUID.self)
+
+        let metadata = try await req.storage.completeMultipartUpload(
+            sessionID: sessionID,
+            userID: userID
+        )
+
+        req.logger.info(
+            "Multipart upload completed",
+            metadata: [
+                "sessionID": .string(sessionID.uuidString),
+                "fileID": .string(metadata.id?.uuidString ?? ""),
+            ]
+        )
+
+        return metadata
+    }
+
+    func abortMultipartUpload(req: Request) async throws -> HTTPStatus {
+        let userID = try req.auth.require(UserPayload.self).getID()
+        let sessionID = try req.parameters.require("sessionID", as: UUID.self)
+
+        try await req.storage.abortMultipartUpload(
+            sessionID: sessionID,
+            userID: userID
+        )
+
+        req.logger.info(
+            "Multipart upload aborted",
+            metadata: [
+                "sessionID": .string(sessionID.uuidString)
+            ]
+        )
+
+        return .noContent
+    }
+
+    func getUploadStatus(req: Request) async throws -> UploadStatusResponse {
+        let userID = try req.auth.require(UserPayload.self).getID()
+        let sessionID = try req.parameters.require("sessionID", as: UUID.self)
+
+        let session = try await req.storage.getUploadSession(
+            sessionID: sessionID,
+            userID: userID
+        )
+
+        return UploadStatusResponse(
+            sessionID: session.id!,
+            fileID: session.fileID,
+            uploadID: session.uploadID,
+            completedParts: session.completedParts.count,
+            totalParts: session.totalParts
+        )
+    }
+}
+
+// MARK: - DTOs
+
+struct InitiateMultipartInput: Content {
+    let filename: String
+    let contentType: String
+    let totalSize: Int64
+    let parentID: UUID?
+    let lastModified: Int64?  // Unix timestamp in milliseconds
+    let chunkSize: Int64?  // Optional, client can specify preferred chunk size
+}
+
+struct InitiateMultipartResponse: Content {
+    let sessionID: UUID
+    let fileID: UUID
+    let uploadID: String
+    let maxChunkSize: Int64
+}
+
+struct UploadPartResponse: Content {
+    let partNumber: Int
+    let etag: String
+}
+
+struct UploadStatusResponse: Content {
+    let sessionID: UUID
+    let fileID: UUID
+    let uploadID: String
+    let completedParts: Int
+    let totalParts: Int
 }
