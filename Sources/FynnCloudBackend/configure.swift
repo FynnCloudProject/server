@@ -8,13 +8,14 @@ import SotoCore
 import Vapor
 
 public func configure(_ app: Application) async throws {
-    // CORS configuration
+    // Load Global Configuration
+    let config = AppConfig.load(for: app)
+    app.config = config
+
+    // CORS Configuration
     let corsConfiguration = CORSMiddleware.Configuration(
-        // Load allowed origins from environment variable
         allowedOrigin: app.environment.isRelease
-            ? .any([
-                Environment.get("CORS_ALLOWED_ORIGINS") ?? "http://localhost:3000"
-            ])
+            ? .any(config.corsAllowedOrigins)
             : .all,
         allowedMethods: [.GET, .POST, .PUT, .OPTIONS, .DELETE, .PATCH],
         allowedHeaders: [
@@ -23,56 +24,88 @@ public func configure(_ app: Application) async throws {
         ],
         allowCredentials: false
     )
-    let cors = CORSMiddleware(configuration: corsConfiguration)
-    app.middleware.use(cors, at: .beginning)
+    app.middleware.use(CORSMiddleware(configuration: corsConfiguration), at: .beginning)
 
-    // app.middleware.use(FileMiddleware(publicDirectory: app.directory.publicDirectory))
-
-    // If database url is set use the provided database (duh), currently only postgres is supported
-    if let databaseURL = Environment.get("DATABASE_URL"), let url = URL(string: databaseURL) {
-        let databaseConfig = try SQLPostgresConfiguration.init(url: url)
-        app.databases.use(.postgres(configuration: databaseConfig), as: .psql)
-    } else {
-        app.databases.use(.sqlite(.file("db.sqlite")), as: .sqlite)
+    // Database Selection (Postgres vs SQLite)
+    switch config.database {
+    case .postgres(let pgConfig):
+        app.databases.use(.postgres(configuration: pgConfig), as: .psql)
+    case .sqlite(let filename):
+        app.databases.use(.sqlite(.file(filename)), as: .sqlite)
     }
 
-    // Setup AWS CLient with lifecycle handler
-    let awsClient = AWSClient(
-        credentialProvider: .static(
-            accessKeyId: Environment.get("AWS_ACCESS_KEY_ID") ?? "",
-            secretAccessKey: Environment.get("AWS_SECRET_ACCESS_KEY") ?? ""),
-        retryPolicy: .default,
-        options: .init(),
-        logger: app.logger
-    )
-    app.services.awsClient.use { _ in awsClient }
-    app.lifecycle.use(AWSLifecycleHandler())
-
-    // Determine storage driver (Local vs S3)
-    if let bucket = Environment.get("S3_BUCKET") {
+    // Storage Driver Selection (Local vs S3)
+    switch config.storage {
+    case .s3(let bucket):
+        app.logger.info("Using S3 storage with bucket: \(bucket)")
+        let awsClient = AWSClient(
+            credentialProvider: .static(
+                accessKeyId: config.awsAccessKey,
+                secretAccessKey: config.awsSecretKey
+            ),
+            retryPolicy: .default,
+            options: .init(),
+            logger: app.logger
+        )
+        app.services.awsClient.use { _ in awsClient }
+        app.lifecycle.use(AWSLifecycleHandler())
         app.storageConfig = .init(driver: .s3(bucket: bucket))
-    } else {
-        app.storageConfig = .init(
-            driver: .local(
-                path: Environment.get("STORAGE_PATH") ?? app.directory.workingDirectory + "Storage/"
-            ))
+    case .local(let path):
+        app.logger.info("Using local storage with path: \(path)")
+        app.storageConfig = .init(driver: .local(path: path))
     }
 
-    // Register migrations
+    // Limits
+    app.routes.defaultMaxBodySize = config.maxBodySize
+
+    // Error Middleware
+    app.middleware.use(
+        ErrorMiddleware { req, error in
+            let status: HTTPResponseStatus
+            let reason: String
+            let headers: HTTPHeaders
+            let localizationKey: String?
+
+            if let localizedError = error as? LocalizedAbort {
+                status = localizedError.status
+                reason = localizedError.reason
+                headers = localizedError.headers
+                localizationKey = localizedError.localizationKey
+            } else if let abort = error as? (any AbortError) {
+                status = abort.status
+                reason = abort.reason
+                headers = abort.headers
+                localizationKey = "error.generic"
+            } else {
+                status = .internalServerError
+                reason =
+                    req.application.environment == .production
+                    ? "An unexpected error occurred."
+                    : String(reflecting: error)
+                headers = [:]
+                localizationKey = "error.generic"
+            }
+
+            let response = Response(status: status, headers: headers)
+            var body: [String: String] = ["error": "true", "reason": reason]
+            if let key = localizationKey { body["localizationKey"] = key }
+            try? response.content.encode(body)
+            return response
+        })
+
+    // JWT Configuration
+    await app.jwt.keys.add(hmac: HMACKey(from: config.jwtSecret), digestAlgorithm: .sha256)
+
+    // Migrations
     app.migrations.add(CreateInitialMigration())
     app.migrations.add(CreateSyncLog())
     app.migrations.add(CreateOAuthCode())
     app.migrations.add(AddClientIdAndStateToOAuthCode())
     app.migrations.add(CreateOAuthGrant())
     app.migrations.add(UpdateGrantForRotation())
+    app.migrations.add(CreateMultipartUploadSessions())
 
-    // Set max body size to 15gb, we should probably switch to chunked uploads
-    // TODO: Switch to chunked uploads
-    app.routes.defaultMaxBodySize = "15gb"
-    try await app.autoMigrate()  // Auto migrate database
-
-    // Generate random jwt secret if not set
-    let jwtSecret = Environment.get("JWT_SECRET") ?? [UInt8].random(count: 32).base64
-    await app.jwt.keys.add(hmac: HMACKey.init(from: jwtSecret), digestAlgorithm: .sha256)
+    // Auto Migrate & register Routes
+    try await app.autoMigrate()
     try routes(app)
 }
