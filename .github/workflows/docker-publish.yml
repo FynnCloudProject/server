@@ -1,0 +1,69 @@
+name: Build And Push Docker image
+
+on:
+  schedule:
+    - cron: "0 23 * * *"
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+jobs:
+  build_and_push:
+    name: Docker Build and Push
+    runs-on: ubuntu-latest
+    # Permissions are critical for GHCR authentication
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            # Tag 'latest' on the default branch (main)
+            type=raw,value=latest,enable={{is_default_branch}}
+            # Tag with the branch name + short SHA for main/dev pushes
+            type=ref,event=branch
+            # Tag SemVer for tags (v1.2.3)
+            type=semver,pattern={{version}}
+            # Tag PR numbers
+            type=ref,event=pr
+          flavor: |
+            latest=false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GHA cache is the fastest way to speed up builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
