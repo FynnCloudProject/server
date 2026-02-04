@@ -36,19 +36,17 @@ RUN --mount=type=cache,target=/build/.build,sharing=locked \
 # ================================
 # Run image
 # ================================
-FROM alpine:3.23
+FROM debian:trixie-slim
 
 # Install minimal runtime dependencies
-RUN apk add --no-cache \
-    libstdc++ \
-    libgcc \
-    ca-certificates \
-    tzdata \
-    libgcompat
-
-# Create a vapor user and group
-RUN addgroup -g 1000 vapor && \
-    adduser -D -u 1000 -G vapor vapor
+RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
+    && apt-get -q update \
+    && apt-get -q install -y \
+      libjemalloc2 \
+      ca-certificates \
+      tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --user-group --create-home --system --skel /dev/null --home-dir /app vapor
 
 WORKDIR /app
 
@@ -57,9 +55,6 @@ COPY --from=build --chown=vapor:vapor /staging /app
 
 # Make resources read-only
 RUN chmod -R a-w ./Public ./Resources 2>/dev/null || true
-
-# Provide configuration needed by the built-in crash reporter
-#ENV SWIFT_BACKTRACE=enable=yes,sanitize=yes,threads=all,images=all,interactive=no,swift-backtrace=./swift-backtrace-static
 
 # Ensure all further commands run as the vapor user
 USER vapor:vapor
