@@ -297,6 +297,7 @@ struct StorageService: Sendable {
             throw error
         }
     }
+
     func rename(fileID: UUID, newName: String, userID: UUID) async throws -> FileMetadata {
         // Fetch the file and validate ownership
         let file = try await validateOwnership(fileID: fileID, userID: userID)
@@ -604,16 +605,27 @@ struct StorageService: Sendable {
             ).localized("upload.error.nameConflict")
         }
     }
-
 }
-// ADD THIS ENTIRE EXTENSION TO YOUR StorageService.swift FILE
-// Place it at the end of the file, before the FileFilter enum extension
 
 extension StorageService {
 
     // MARK: - Multipart Upload Operations
 
-    /// Initiate a multipart upload session
+    /// Response from initiating a multipart upload
+    struct InitiatedUploadSession: Sendable {
+        let sessionID: UUID
+        let fileID: UUID
+        let uploadID: String
+        let filename: String
+        let contentType: String
+        let totalSize: Int64
+        let maxChunkSize: Int64
+        let parentID: UUID?
+        let lastModified: Int64?
+        let userID: UUID
+    }
+
+    /// Initiate a multipart upload session (creates minimal session for cleanup/audit)
     func initiateMultipartUpload(
         filename: String,
         contentType: String,
@@ -622,7 +634,7 @@ extension StorageService {
         lastModified: Int64?,
         userID: UUID,
         request: Request
-    ) async throws -> MultipartUploadSession {
+    ) async throws -> InitiatedUploadSession {
 
         if let parentID = parentID {
             try await validateOwnership(fileID: parentID, userID: userID)
@@ -632,193 +644,207 @@ extension StorageService {
 
         // Generate file ID (but don't create FileMetadata yet)
         let fileID = UUID()
+        let sessionID = UUID()
         let maxChunkSize = request.application.config.maxChunkSize
+
         // Initiate upload with storage provider
         let uploadID = try await provider.initiateMultipartUpload(id: fileID)
 
-        // Create upload session record - this stores everything during upload
-        let session = MultipartUploadSession()
-        session.id = UUID()
-        session.fileID = fileID
-        session.uploadID = uploadID
-        session.userID = userID
-        session.filename = filename
-        session.contentType = contentType
-        session.totalSize = totalSize
-        session.maxChunkSize = Int64(maxChunkSize.value)
-        session.parentID = parentID
-        session.lastModified = lastModified
-        session.totalParts = 0
-        session.completedParts = []
+        // Create minimal session in database (for cleanup/audit only)
+        let session = MultipartUploadSession(
+            id: sessionID,
+            fileID: fileID,
+            uploadID: uploadID,
+            userID: userID,
+            filename: filename,
+            totalSize: totalSize,
+            expiresAt: Date().addingTimeInterval(86400)  // 24 hours
+        )
 
         try await session.save(on: db)
 
         logger.info(
             "Multipart upload initiated",
             metadata: [
+                "sessionID": .string(sessionID.uuidString),
                 "fileID": .string(fileID.uuidString),
                 "uploadID": .string(uploadID),
                 "filename": .string(filename),
             ]
         )
 
-        return session
+        // Return full session data for JWT (all metadata in token)
+        return InitiatedUploadSession(
+            sessionID: sessionID,
+            fileID: fileID,
+            uploadID: uploadID,
+            filename: filename,
+            contentType: contentType,
+            totalSize: totalSize,
+            maxChunkSize: Int64(maxChunkSize.value),
+            parentID: parentID,
+            lastModified: lastModified,
+            userID: userID
+        )
     }
 
-    /// Upload a single part
-    func uploadPart(
-        sessionID: UUID,
+    /// Upload a single part - STATELESS: No DB operations, just streams to provider
+    func uploadPartWithToken(
+        fileID: UUID,
+        uploadID: String,
         partNumber: Int,
         stream: Request.Body,
         size: Int64
     ) async throws -> CompletedPart {
-        guard let session = try await MultipartUploadSession.find(sessionID, on: db) else {
-            throw Abort(.notFound, reason: "Upload session not found")
+
+        // Validate part number (S3 allows 1-10000)
+        guard partNumber > 0 && partNumber <= 10000 else {
+            throw Abort(.badRequest, reason: "Part number must be between 1 and 10000")
         }
 
-        // Verify ownership
-        guard session.userID == session.userID else {
-            throw Abort(.forbidden)
-        }
-
+        // Upload the part to storage provider - NO DB operations!
         let completedPart = try await provider.uploadPart(
-            id: session.fileID,
-            uploadID: session.uploadID,
+            id: fileID,
+            uploadID: uploadID,
             partNumber: partNumber,
             stream: stream,
             maxSize: size,
             on: eventLoop
         )
 
-        // Update session with completed part
-        var parts = session.completedParts
-        parts.append(completedPart)
-        session.completedParts = parts
-        try await session.save(on: db)
-
-        logger.info(
+        logger.debug(
             "Part uploaded",
             metadata: [
-                "sessionID": .string(sessionID.uuidString),
+                "fileID": .string(fileID.uuidString),
                 "partNumber": .string("\(partNumber)"),
-                "size": .string("\(size)"),
+                "etag": .string(completedPart.etag),
+                "size": .string("\(completedPart.size)"),
             ]
         )
 
         return completedPart
     }
 
-    /// Complete the multipart upload
-    func completeMultipartUpload(
+    /// Complete the multipart upload - accepts parts from client, deletes session
+    func completeMultipartUploadWithToken(
         sessionID: UUID,
-        userID: UUID
+        fileID: UUID,
+        uploadID: String,
+        userID: UUID,
+        filename: String,
+        contentType: String,
+        totalSize: Int64,
+        parentID: UUID?,
+        lastModified: Int64?,
+        parts: [CompletedPart]
     ) async throws -> FileMetadata {
-        guard let session = try await MultipartUploadSession.find(sessionID, on: db) else {
-            throw Abort(.notFound, reason: "Upload session not found")
+
+        // SECURITY: Prevent double-completion - check if this fileID already exists
+        if let existing = try await FileMetadata.find(fileID, on: db) {
+            logger.warning(
+                "Attempted double-completion of upload",
+                metadata: [
+                    "sessionID": .string(sessionID.uuidString),
+                    "fileID": .string(fileID.uuidString),
+                    "uploadID": .string(uploadID),
+                    "existingFile": .string(existing.filename),
+                ]
+            )
+            throw Abort(.conflict, reason: "Upload already completed")
         }
 
-        // Verify ownership
-        guard session.userID == userID else {
-            throw Abort(.forbidden)
+        // Validate parts array
+        guard !parts.isEmpty else {
+            throw Abort(.badRequest, reason: "No parts provided")
         }
 
-        // Ensure parent directory exists (if specified)
-        if let parentID = session.parentID {
-            let parentDir = try await validateOwnership(fileID: parentID, userID: userID)
-            guard parentDir.isDirectory else {
-                throw Abort(.badRequest, reason: "Parent is not a directory")
-            }
+        // Validate sequential parts (1, 2, 3, ...)
+        let sortedParts = parts.sorted { $0.partNumber < $1.partNumber }
+        let expectedParts = Set(1...sortedParts.count)
+        let actualParts = Set(sortedParts.map { $0.partNumber })
+
+        guard expectedParts == actualParts else {
+            throw Abort(.badRequest, reason: "Missing or duplicate parts - upload incomplete")
         }
 
-        // Complete the upload with the storage provider
+        // Complete with provider (provider validates ETags)
         try await provider.completeMultipartUpload(
-            id: session.fileID,
-            uploadID: session.uploadID,
-            parts: session.completedParts
+            id: fileID,
+            uploadID: uploadID,
+            parts: sortedParts
         )
 
-        // NOW create the FileMetadata (only after successful upload)
-        // Copy all metadata from session to FileMetadata
+        // Create FileMetadata
         let metadata = FileMetadata(
-            id: session.fileID,
-            filename: session.filename,
-            contentType: session.contentType,
-            size: session.totalSize,
-            parentID: session.parentID,
+            id: fileID,
+            filename: filename,
+            contentType: contentType,
+            size: totalSize,
+            parentID: parentID,
             ownerID: userID,
-            lastModified: session.lastModified.map {
-                Date(timeIntervalSince1970: TimeInterval($0) / 1000)
-            } ?? Date()
+            lastModified: lastModified != nil
+                ? Date(timeIntervalSince1970: TimeInterval(lastModified!) / 1000) : nil
         )
-
-        // Set lastModified if provided, otherwise use current time
-        if let lastModified = session.lastModified {
-            metadata.lastModified = Date(timeIntervalSince1970: TimeInterval(lastModified / 1000))
-        }
-
-        if let parentID = session.parentID {
-            metadata.parent = try await FileMetadata.find(parentID, on: db)
-        }
 
         try await metadata.save(on: db)
 
-        // Clean up session
-        try await session.delete(on: db)
+        // Record sync change for the new file
+        try await recordSyncChange(
+            fileID: fileID,
+            userID: userID,
+            type: .upsert,
+            contentUpdated: true,
+            on: db
+        )
+
+        // Delete session record (cleanup)
+        if let session = try await MultipartUploadSession.find(sessionID, on: db) {
+            try await session.delete(on: db)
+        }
 
         logger.info(
             "Multipart upload completed",
             metadata: [
-                "fileID": .string(session.fileID.uuidString),
-                "uploadID": .string(session.uploadID),
+                "sessionID": .string(sessionID.uuidString),
+                "fileID": .string(fileID.uuidString),
+                "filename": .string(filename),
+                "size": .string("\(totalSize)"),
             ]
         )
 
         return metadata
     }
 
-    /// Abort a multipart upload
+    /// Abort a multipart upload (uses JWT metadata + deletes session)
     func abortMultipartUpload(
+        fileID: UUID,
+        uploadID: String,
         sessionID: UUID,
+        totalSize: Int64,
         userID: UUID
     ) async throws {
-        guard let session = try await MultipartUploadSession.find(sessionID, on: db) else {
-            throw Abort(.notFound, reason: "Upload session not found")
-        }
-
-        // Verify ownership
-        guard session.userID == userID else {
-            throw Abort(.forbidden)
-        }
+        // Reclaim the reserved quota
+        try? await decrementQuota(amount: totalSize, userID: userID)
 
         // Abort with storage provider (cleans up chunks)
-        try await provider.abortMultipartUpload(
-            id: session.fileID,
-            uploadID: session.uploadID
+        try? await provider.abortMultipartUpload(
+            id: fileID,
+            uploadID: uploadID
         )
 
-        // Delete session (no FileMetadata to clean up since it was never created)
-        try await session.delete(on: db)
+        // Delete session record (cleanup)
+        if let session = try await MultipartUploadSession.find(sessionID, on: db) {
+            try await session.delete(on: db)
+        }
 
         logger.info(
             "Multipart upload aborted",
             metadata: [
                 "sessionID": .string(sessionID.uuidString),
-                "uploadID": .string(session.uploadID),
+                "fileID": .string(fileID.uuidString),
+                "uploadID": .string(uploadID),
             ]
         )
-    }
-
-    /// Get upload session status
-    func getUploadSession(sessionID: UUID, userID: UUID) async throws -> MultipartUploadSession {
-        guard let session = try await MultipartUploadSession.find(sessionID, on: db) else {
-            throw Abort(.notFound, reason: "Upload session not found")
-        }
-
-        guard session.userID == userID else {
-            throw Abort(.forbidden)
-        }
-
-        return session
     }
 }
 
