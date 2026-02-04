@@ -35,6 +35,7 @@ let package = Package(
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "SotoS3", package: "soto"),
             ],
+            path: "Sources/FynnCloudBackend",
             swiftSettings: swiftSettings
         ),
         .testTarget(
@@ -43,6 +44,7 @@ let package = Package(
                 .target(name: "FynnCloudBackend"),
                 .product(name: "VaporTesting", package: "vapor"),
             ],
+            path: "Tests/FynnCloudBackendTests",
             swiftSettings: swiftSettings
         ),
     ]
