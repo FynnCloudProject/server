@@ -29,37 +29,43 @@ RUN --mount=type=cache,target=/build/.build,sharing=locked \
         -Xswiftc -j$(nproc) \
     && mkdir -p /staging \
     && cp ".build/release/FynnCloudBackend" /staging \
-    && find -L ".build/release" -regex '.*\.resources$' -exec cp -Ra {} /staging \; \
-    && cp "/usr/libexec/swift/linux/swift-backtrace-static" /staging \
+    && strip --strip-all /staging/FynnCloudBackend \
     && ([ -d /build/Public ] && cp -R /build/Public /staging/ || true) \
     && ([ -d /build/Resources ] && cp -R /build/Resources /staging/ || true)
 
 # ================================
 # Run image
 # ================================
-FROM ubuntu:noble
+FROM alpine:3.23
 
-RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
-    && apt-get -q update \
-    && apt-get -q dist-upgrade -y \
-    && apt-get -q install -y \
-      libjemalloc2 \
-      ca-certificates \
-      tzdata \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --user-group --create-home --system --skel /dev/null --home-dir /app vapor
+# Install minimal runtime dependencies
+RUN apk add --no-cache \
+    libstdc++ \
+    libgcc \
+    ca-certificates \
+    tzdata
+
+# Create a vapor user and group
+RUN addgroup -g 1000 vapor && \
+    adduser -D -u 1000 -G vapor vapor
 
 WORKDIR /app
 
+# Copy built executable and any staged resources from builder
 COPY --from=build --chown=vapor:vapor /staging /app
 
+# Make resources read-only
 RUN chmod -R a-w ./Public ./Resources 2>/dev/null || true
 
-ENV SWIFT_BACKTRACE=enable=yes,sanitize=yes,threads=all,images=all,interactive=no,swift-backtrace=./swift-backtrace-static
+# Provide configuration needed by the built-in crash reporter
+#ENV SWIFT_BACKTRACE=enable=yes,sanitize=yes,threads=all,images=all,interactive=no,swift-backtrace=./swift-backtrace-static
 
+# Ensure all further commands run as the vapor user
 USER vapor:vapor
 
+# Let Docker bind to port 8080
 EXPOSE 8080
 
+# Start the Vapor service when the image is run
 ENTRYPOINT ["./FynnCloudBackend"]
 CMD ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
