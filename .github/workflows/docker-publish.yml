@@ -16,7 +16,7 @@ on:
 jobs:
   build_and_push:
     name: Docker Build and Push
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04-arm
     # Permissions are critical for GHCR authentication
     permissions:
       contents: read
