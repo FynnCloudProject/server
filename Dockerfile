@@ -43,7 +43,8 @@ RUN apk add --no-cache \
     libstdc++ \
     libgcc \
     ca-certificates \
-    tzdata
+    tzdata \
+    libgcompat
 
 # Create a vapor user and group
 RUN addgroup -g 1000 vapor && \
