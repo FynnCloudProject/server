@@ -17,8 +17,6 @@ let package = Package(
         .package(url: "https://github.com/vapor/fluent-postgres-driver.git", from: "2.12.0"),
         // 📝 JWT for JWT authentication.
         .package(url: "https://github.com/vapor/jwt.git", from: "5.1.2"),
-        // 🍃 An expressive, performant, and extensible templating language built for Swift.
-        .package(url: "https://github.com/vapor/leaf.git", from: "4.3.0"),
         // AWS SDK for Swift
         .package(url: "https://github.com/soto-project/soto.git", from: "7.12.0"),
         // 🔵 Non-blocking, event-driven networking for Swift. Used for custom executors
@@ -31,7 +29,6 @@ let package = Package(
                 .product(name: "Fluent", package: "fluent"),
                 .product(name: "FluentSQLiteDriver", package: "fluent-sqlite-driver"),
                 .product(name: "FluentPostgresDriver", package: "fluent-postgres-driver"),
-                .product(name: "Leaf", package: "leaf"),
                 .product(name: "JWT", package: "jwt"),
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "NIOCore", package: "swift-nio"),
