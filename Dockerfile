@@ -27,9 +27,9 @@ RUN --mount=type=cache,target=/build/.build,sharing=locked \
         --static-swift-stdlib \
         -Xlinker -ljemalloc \
         -Xswiftc -j$(nproc) \
+        -Xswiftc -gnone \
     && mkdir -p /staging \
     && cp ".build/release/FynnCloudBackend" /staging \
-    && strip --strip-all /staging/FynnCloudBackend \
     && ([ -d /build/Public ] && cp -R /build/Public /staging/ || true) \
     && ([ -d /build/Resources ] && cp -R /build/Resources /staging/ || true)
 
