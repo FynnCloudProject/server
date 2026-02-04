@@ -80,7 +80,7 @@ struct AppConfig: Sendable {
             maxBodySize: maxBodySize,
             maxChunkSize: maxChunkSize,
             jwtSecret: Environment.get("JWT_SECRET") ?? [UInt8].random(count: 32).base64,
-            corsAllowedOrigins: (Environment.get("CORS_ALLOWED_ORIGINS") ?? "http://localhost:3000")
+            corsAllowedOrigins: (Environment.get("CORS_ALLOWED_ORIGINS") ?? "http://localhost")
                 .split(separator: ",").map(String.init),
             aws: AWSConfig(
                 accessKey: Environment.get("AWS_ACCESS_KEY_ID") ?? "",
