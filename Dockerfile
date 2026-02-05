@@ -56,6 +56,9 @@ COPY --from=build --chown=vapor:vapor /staging /app
 # Make resources read-only
 RUN chmod -R a-w ./Public ./Resources 2>/dev/null || true
 
+# Create Storage directory with correct permissions
+RUN mkdir -p /app/Storage && chown -R vapor:vapor /app/Storage
+
 # Ensure all further commands run as the vapor user
 USER vapor:vapor
 
