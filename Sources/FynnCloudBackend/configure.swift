@@ -13,7 +13,7 @@ public func configure(_ app: Application) async throws {
 
     // CORS Configuration
     let corsConfiguration = CORSMiddleware.Configuration(
-        allowedOrigin: app.environment.isRelease
+        allowedOrigin: app.environment == .production
             ? .any(config.corsAllowedOrigins)
             : .all,
         allowedMethods: [.GET, .POST, .PUT, .OPTIONS, .DELETE, .PATCH],
