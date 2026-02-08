@@ -1,0 +1,72 @@
+name: Build Release Binaries
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build ${{ matrix.os-label }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            os-label: linux
+            arch: x86_64
+          - os: macos-latest
+            os-label: macos
+            arch: universal
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.1"
+
+      - name: Install Dependencies (Linux)
+        if: matrix.os-label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjemalloc-dev
+
+      - name: Cache Swift PM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Build Release
+        run: |
+          if [ "${{ matrix.os-label }}" == "macos" ]; then
+            swift build -c release --product FynnCloudBackend --static-swift-stdlib --arch arm64 --arch x86_64
+          else
+            swift build -c release --product FynnCloudBackend --static-swift-stdlib -Xlinker -ljemalloc -Xswiftc -gnone
+          fi
+
+      - name: Prepare Artifacts
+        run: |
+          # Create a specific folder name like FynnCloudBackend-linux-x86_64
+          STAGING_DIR="FynnCloudBackend-${{ matrix.os-label }}-${{ matrix.arch }}"
+          mkdir -p "$STAGING_DIR"
+
+          cp .build/release/FynnCloudBackend "$STAGING_DIR/"
+          [ -d Public ] && cp -R Public "$STAGING_DIR/" || true
+          [ -d Resources ] && cp -R Resources "$STAGING_DIR/" || true
+
+          # Set an environment variable for the next step to use
+          echo "STAGING_DIR=$STAGING_DIR" >> $GITHUB_ENV
+
+      - name: Upload Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAGING_DIR }}
+          path: ${{ env.STAGING_DIR }}/
