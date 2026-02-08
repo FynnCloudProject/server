@@ -7,7 +7,8 @@ struct S3StorageProvider: FileStorageProvider {
     let bucket: String
 
     private func getObjectKey(for id: UUID, userID: UUID) -> String {
-        return "\(userID.uuidString)/\(id.uuidString)"
+        let prefix = String(id.uuidString.prefix(2))
+        return "\(userID.uuidString)/\(prefix)/\(id.uuidString)"
     }
 
     // MARK: - Single Request Upload (with size validation)
