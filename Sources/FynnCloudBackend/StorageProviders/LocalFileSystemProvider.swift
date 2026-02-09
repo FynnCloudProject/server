@@ -7,25 +7,66 @@ import Vapor
 struct LocalFileSystemProvider: FileStorageProvider {
     let storageDirectory: String
 
-    // Directory for storing temporary chunks during multipart uploads
-    private func chunksDirectory(for userID: UUID) -> String {
-        storageDirectory + userID.uuidString + "/_chunks/"
+    /// A `FileSystem` instance backed by Vapor's managed thread pool.
+    /// This avoids the separate 2-thread pool that `FileSystem.shared` creates,
+    /// while still using the modern (non-deprecated) NIOFileSystem API.
+    let fileSystem: FileSystem
+
+    /// Initialize with Vapor's managed thread pool.
+    ///
+    /// Typical usage:
+    /// ```
+    /// LocalFileSystemProvider(
+    ///     storageDirectory: "/data/uploads/",
+    ///     threadPool: app.threadPool
+    /// )
+    /// ```
+    init(storageDirectory: String, threadPool: NIOThreadPool) {
+        self.storageDirectory = storageDirectory
+        self.fileSystem = FileSystem(threadPool: threadPool)
     }
 
-    private func getInternalPath(for id: UUID, userID: UUID) -> String {
+    // MARK: - Path Helpers
+
+    private func getInternalPath(for id: UUID, userID: UUID) -> FilePath {
         let uuidString = id.uuidString
         let prefix = String(uuidString.prefix(2))
-        return storageDirectory + userID.uuidString + "/" + prefix + "/" + uuidString
+        var path = FilePath(storageDirectory)
+        path.append(userID.uuidString)
+        path.append(prefix)
+        path.append(uuidString)
+        return path
     }
 
-    private func getChunkDirectory(for id: UUID, userID: UUID, uploadID: String) -> String {
-        return chunksDirectory(for: userID) + id.uuidString + "/" + uploadID + "/"
+    private func getChunkDirectory(for id: UUID, userID: UUID, uploadID: String) -> FilePath {
+        var path = FilePath(storageDirectory)
+        path.append(userID.uuidString)
+        path.append("_chunks")
+        path.append(id.uuidString)
+        path.append(uploadID)
+        return path
     }
 
     private func getChunkPath(for id: UUID, userID: UUID, uploadID: String, partNumber: Int)
-        -> String
+        -> FilePath
     {
-        return getChunkDirectory(for: id, userID: userID, uploadID: uploadID) + "part_\(partNumber)"
+        var path = getChunkDirectory(for: id, userID: userID, uploadID: uploadID)
+        path.append("part_\(partNumber)")
+        return path
+    }
+
+    private func userDirectory(for userID: UUID) -> FilePath {
+        var path = FilePath(storageDirectory)
+        path.append(userID.uuidString)
+        return path
+    }
+
+    /// Guards against path traversal — resolved paths must stay within the storage root.
+    private func assertWithinStorageRoot(_ path: FilePath) {
+        precondition(
+            path.string.hasPrefix(storageDirectory),
+            "Resolved path \(path) escapes storage root \(storageDirectory)"
+        )
     }
 
     // MARK: - Download
@@ -33,9 +74,13 @@ struct LocalFileSystemProvider: FileStorageProvider {
     func getResponse(for id: UUID, userID: UUID, on eventLoop: any EventLoop) async throws
         -> Response
     {
-        let path = getInternalPath(for: id, userID: userID)
+        let filePath = getInternalPath(for: id, userID: userID)
+        assertWithinStorageRoot(filePath)
 
-        guard let info = try await FileSystem.shared.info(forFileAt: FilePath(path)) else {
+        guard
+            let info = try await fileSystem.info(
+                forFileAt: filePath, infoAboutSymbolicLink: false)
+        else {
             throw Abort(.notFound).localized("error.generic")
         }
 
@@ -43,13 +88,15 @@ struct LocalFileSystemProvider: FileStorageProvider {
             stream: { writer in
                 Task {
                     do {
-                        try await FileSystem.shared.withFileHandle(forReadingAt: FilePath(path)) {
-                            handle in
+                        try await self.fileSystem.withFileHandle(
+                            forReadingAt: filePath
+                        ) { handle in
                             for try await chunk in handle.readChunks() {
-                                _ = writer.write(.buffer(chunk))
+                                // Await backpressure signal before reading more data
+                                try await writer.write(.buffer(chunk)).get()
                             }
                         }
-                        _ = writer.write(.end)
+                        try await writer.write(.end).get()
                     } catch {
                         _ = writer.write(.error(error))
                     }
@@ -68,56 +115,65 @@ struct LocalFileSystemProvider: FileStorageProvider {
         maxSize: Int64,
         on eventLoop: any EventLoop
     ) async throws -> Int64 {
-        let path = getInternalPath(for: id, userID: userID)
-        let filePath = FilePath(path)
+        let filePath = getInternalPath(for: id, userID: userID)
+        assertWithinStorageRoot(filePath)
 
-        try await FileSystem.shared.createDirectory(
+        try await fileSystem.createDirectory(
             at: filePath.removingLastComponent(),
-            withIntermediateDirectories: true
+            withIntermediateDirectories: true,
+            permissions: nil
         )
 
         let countingBody = ByteCountingBody(wrappedBody: stream, maxAllowedSize: maxSize)
 
-        try await FileSystem.shared.withFileHandle(
-            forWritingAt: filePath,
-            options: .newFile(replaceExisting: true)
-        ) { handle in
-            var offset: Int64 = 0
+        do {
+            try await fileSystem.withFileHandle(
+                forWritingAt: filePath,
+                options: .newFile(replaceExisting: true)
+            ) { handle in
+                var writer = handle.bufferedWriter(capacity: .bytes(128 * 1024))
 
-            for try await chunk in countingBody {
-                try await handle.write(contentsOf: chunk, toAbsoluteOffset: .init(offset))
-                offset += Int64(chunk.readableBytes)
+                for try await chunk in countingBody {
+                    try await writer.write(contentsOf: chunk.readableBytesView)
+                }
+
+                try await writer.flush()
             }
+        } catch {
+            // Clean up partial file on failure
+            try? await fileSystem.removeItem(
+                at: filePath, strategy: .platformDefault, recursively: false)
+            throw error
         }
 
         return countingBody.bytesReceived
     }
 
     func delete(id: UUID, userID: UUID) async throws {
-        try await FileSystem.shared.removeItem(
-            at: FilePath(getInternalPath(for: id, userID: userID)))
-        if try await exists(id: id, userID: userID) {
-            throw Abort(.internalServerError).localized("error.generic")
-        }
+        let filePath = getInternalPath(for: id, userID: userID)
+        assertWithinStorageRoot(filePath)
+        try await fileSystem.removeItem(
+            at: filePath, strategy: .platformDefault, recursively: false)
     }
 
     func exists(id: UUID, userID: UUID) async throws -> Bool {
-        let info = try await FileSystem.shared.info(
-            forFileAt: FilePath(getInternalPath(for: id, userID: userID)))
+        let filePath = getInternalPath(for: id, userID: userID)
+        let info = try await fileSystem.info(forFileAt: filePath, infoAboutSymbolicLink: false)
         return info != nil
     }
 
     // MARK: - Multipart Upload (with size validation)
 
     func initiateMultipartUpload(id: UUID, userID: UUID) async throws -> String {
-        // Generate a unique upload ID
         let uploadID = UUID().uuidString
 
-        // Create directory for this upload's chunks
         let chunkDir = getChunkDirectory(for: id, userID: userID, uploadID: uploadID)
-        try await FileSystem.shared.createDirectory(
-            at: FilePath(chunkDir),
-            withIntermediateDirectories: true
+        assertWithinStorageRoot(chunkDir)
+
+        try await fileSystem.createDirectory(
+            at: chunkDir,
+            withIntermediateDirectories: true,
+            permissions: nil
         )
 
         return uploadID
@@ -132,35 +188,39 @@ struct LocalFileSystemProvider: FileStorageProvider {
         maxSize: Int64,
         on eventLoop: any EventLoop
     ) async throws -> CompletedPart {
-        let chunkPath = getChunkPath(
+        let filePath = getChunkPath(
             for: id, userID: userID, uploadID: uploadID, partNumber: partNumber)
-        let filePath = FilePath(chunkPath)
+        assertWithinStorageRoot(filePath)
 
         let countingBody = ByteCountingBody(wrappedBody: stream, maxAllowedSize: maxSize)
 
-        // Initialize MD5 hasher for streaming hash calculation
+        // MD5 is used intentionally for S3-compatible ETag generation, not for security.
         var hasher = Insecure.MD5()
 
-        // Write chunk to temporary file while calculating hash
-        try await FileSystem.shared.withFileHandle(
-            forWritingAt: filePath,
-            options: .newFile(replaceExisting: true)
-        ) { handle in
-            var offset: Int64 = 0
+        do {
+            try await fileSystem.withFileHandle(
+                forWritingAt: filePath,
+                options: .newFile(replaceExisting: true)
+            ) { handle in
+                var writer = handle.bufferedWriter(capacity: .bytes(128 * 1024))
 
-            for try await chunk in countingBody {
-                // Update hash with this chunk's data
-                chunk.withUnsafeReadableBytes { bufferPointer in
-                    hasher.update(bufferPointer: bufferPointer)
+                for try await chunk in countingBody {
+                    chunk.withUnsafeReadableBytes { bufferPointer in
+                        hasher.update(bufferPointer: bufferPointer)
+                    }
+
+                    try await writer.write(contentsOf: chunk.readableBytesView)
                 }
 
-                // Write chunk to disk
-                try await handle.write(contentsOf: chunk, toAbsoluteOffset: .init(offset))
-                offset += Int64(chunk.readableBytes)
+                try await writer.flush()
             }
+        } catch {
+            // Clean up partial chunk on failure
+            try? await fileSystem.removeItem(
+                at: filePath, strategy: .platformDefault, recursively: false)
+            throw error
         }
 
-        // Finalize hash
         let hash = hasher.finalize()
         let etag = hash.map { String(format: "%02x", $0) }.joined()
 
@@ -177,70 +237,92 @@ struct LocalFileSystemProvider: FileStorageProvider {
         uploadID: String,
         parts: [CompletedPart]
     ) async throws {
-        let finalPath = getInternalPath(for: id, userID: userID)
-        let finalFilePath = FilePath(finalPath)
+        let finalFilePath = getInternalPath(for: id, userID: userID)
         let chunkDir = getChunkDirectory(for: id, userID: userID, uploadID: uploadID)
+        assertWithinStorageRoot(finalFilePath)
+        assertWithinStorageRoot(chunkDir)
 
-        // Ensure final directory exists
-        try await FileSystem.shared.createDirectory(
+        try await fileSystem.createDirectory(
             at: finalFilePath.removingLastComponent(),
-            withIntermediateDirectories: true
+            withIntermediateDirectories: true,
+            permissions: nil
         )
 
-        // Sort parts by part number
         let sortedParts = parts.sorted { $0.partNumber < $1.partNumber }
 
-        // Concatenate all chunks into the final file
-        try await FileSystem.shared.withFileHandle(
-            forWritingAt: finalFilePath,
-            options: .newFile(replaceExisting: true)
-        ) { outputHandle in
-            var offset: Int64 = 0
+        do {
+            try await fileSystem.withFileHandle(
+                forWritingAt: finalFilePath,
+                options: .newFile(replaceExisting: true)
+            ) { outputHandle in
+                var offset: Int64 = 0
 
-            for part in sortedParts {
-                let chunkPath = getChunkPath(
-                    for: id, userID: userID, uploadID: uploadID, partNumber: part.partNumber)
+                for part in sortedParts {
+                    let chunkPath = getChunkPath(
+                        for: id, userID: userID, uploadID: uploadID,
+                        partNumber: part.partNumber)
 
-                // Verify chunk exists
-                guard
-                    let chunkInfo = try await FileSystem.shared.info(forFileAt: FilePath(chunkPath))
-                else {
-                    throw Abort(.internalServerError, reason: "Chunk \(part.partNumber) not found")
-                }
+                    // Verify chunk exists and size matches what was reported during upload
+                    guard
+                        let chunkInfo = try await fileSystem.info(
+                            forFileAt: chunkPath, infoAboutSymbolicLink: false)
+                    else {
+                        throw Abort(
+                            .internalServerError,
+                            reason: "Chunk \(part.partNumber) not found")
+                    }
 
-                // Read and write chunk
-                try await FileSystem.shared.withFileHandle(forReadingAt: FilePath(chunkPath)) {
-                    inputHandle in
-                    for try await chunk in inputHandle.readChunks() {
-                        try await outputHandle.write(
-                            contentsOf: chunk, toAbsoluteOffset: .init(offset))
-                        offset += Int64(chunk.readableBytes)
+                    guard Int64(chunkInfo.size) == part.size else {
+                        throw Abort(
+                            .internalServerError,
+                            reason:
+                                "Size mismatch for part \(part.partNumber): "
+                                + "expected \(part.size), got \(chunkInfo.size)")
+                    }
+
+                    // Read chunk and append to output file
+                    try await fileSystem.withFileHandle(forReadingAt: chunkPath) {
+                        inputHandle in
+                        for try await chunk in inputHandle.readChunks() {
+                            try await outputHandle.write(
+                                contentsOf: chunk, toAbsoluteOffset: .init(offset))
+                            offset += Int64(chunk.readableBytes)
+                        }
                     }
                 }
             }
+        } catch {
+            // Clean up partial final file; preserve chunks so the caller can retry.
+            try? await fileSystem.removeItem(
+                at: finalFilePath, strategy: .platformDefault, recursively: false)
+            throw error
         }
 
-        // Clean up chunks directory
-        try await FileSystem.shared.removeItem(at: FilePath(chunkDir))
+        // Clean up chunks directory after successful assembly
+        try? await fileSystem.removeItem(
+            at: chunkDir, strategy: .platformDefault, recursively: true)
     }
 
     func abortMultipartUpload(id: UUID, userID: UUID, uploadID: String) async throws {
         let chunkDir = getChunkDirectory(for: id, userID: userID, uploadID: uploadID)
+        assertWithinStorageRoot(chunkDir)
 
-        // Remove the chunks directory if it exists
-        if try await FileSystem.shared.info(forFileAt: FilePath(chunkDir)) != nil {
-            try await FileSystem.shared.removeItem(at: FilePath(chunkDir))
+        if try await fileSystem.info(forFileAt: chunkDir, infoAboutSymbolicLink: false) != nil {
+            try await fileSystem.removeItem(
+                at: chunkDir, strategy: .platformDefault, recursively: true)
         }
     }
 
     // MARK: - User Operations
 
-    /// Delete all files for a specific user
+    /// Delete all files for a specific user.
     func deleteUserData(userID: UUID) async throws {
-        let userDir = storageDirectory + userID.uuidString + "/"
-        if try await FileSystem.shared.info(forFileAt: FilePath(userDir)) != nil {
-            try await FileSystem.shared.removeItem(at: FilePath(userDir))
+        let userDir = userDirectory(for: userID)
+        assertWithinStorageRoot(userDir)
+
+        if try await fileSystem.info(forFileAt: userDir, infoAboutSymbolicLink: false) != nil {
+            try await fileSystem.removeItem(
+                at: userDir, strategy: .platformDefault, recursively: true)
         }
     }
-
 }

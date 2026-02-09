@@ -13,7 +13,8 @@ extension Request {
         switch config.driver {
         case .local(let path):
             provider = LocalFileSystemProvider(
-                storageDirectory: path
+                storageDirectory: path,
+                threadPool: application.threadPool
             )
 
         case .s3(let bucket):
