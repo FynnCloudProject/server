@@ -6,25 +6,7 @@ import Vapor
 
 struct LocalFileSystemProvider: FileStorageProvider {
     let storageDirectory: String
-
-    /// A `FileSystem` instance backed by Vapor's managed thread pool.
-    /// This avoids the separate 2-thread pool that `FileSystem.shared` creates,
-    /// while still using the modern (non-deprecated) NIOFileSystem API.
-    let fileSystem: FileSystem
-
-    /// Initialize with Vapor's managed thread pool.
-    ///
-    /// Typical usage:
-    /// ```
-    /// LocalFileSystemProvider(
-    ///     storageDirectory: "/data/uploads/",
-    ///     threadPool: app.threadPool
-    /// )
-    /// ```
-    init(storageDirectory: String, threadPool: NIOThreadPool) {
-        self.storageDirectory = storageDirectory
-        self.fileSystem = FileSystem(threadPool: threadPool)
-    }
+    private var fileSystem: FileSystem { .shared }
 
     // MARK: - Path Helpers
 
