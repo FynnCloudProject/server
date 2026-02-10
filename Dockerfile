@@ -45,7 +45,7 @@ RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
     && apt-get -q update \
     && apt-get -q install -y \
       libjemalloc2 \
-      libldap-2.5-0 \
+      libldap2 \         
       ca-certificates \
       tzdata \
     && rm -rf /var/lib/apt/lists/* \
