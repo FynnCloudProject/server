@@ -123,7 +123,7 @@ struct LocalFileSystemProvider: FileStorageProvider {
             }
         } catch {
             // Clean up partial file on failure
-            try? await fileSystem.removeItem(
+            try await fileSystem.removeItem(
                 at: filePath, strategy: .platformDefault, recursively: false)
             throw error
         }
@@ -198,7 +198,7 @@ struct LocalFileSystemProvider: FileStorageProvider {
             }
         } catch {
             // Clean up partial chunk on failure
-            try? await fileSystem.removeItem(
+            _ = try? await fileSystem.removeItem(
                 at: filePath, strategy: .platformDefault, recursively: false)
             throw error
         }
@@ -275,13 +275,13 @@ struct LocalFileSystemProvider: FileStorageProvider {
             }
         } catch {
             // Clean up partial final file; preserve chunks so the caller can retry.
-            try? await fileSystem.removeItem(
+            try await fileSystem.removeItem(
                 at: finalFilePath, strategy: .platformDefault, recursively: false)
             throw error
         }
 
         // Clean up chunks directory after successful assembly
-        try? await fileSystem.removeItem(
+        try await fileSystem.removeItem(
             at: chunkDir, strategy: .platformDefault, recursively: true)
     }
 
