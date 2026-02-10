@@ -7,7 +7,9 @@ FROM swift:6.1-noble AS build
 RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
     && apt-get -q update \
     && apt-get -q dist-upgrade -y \
-    && apt-get install -y libjemalloc-dev \
+    && apt-get install -y \
+       libjemalloc-dev \
+       libldap-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -43,6 +45,7 @@ RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
     && apt-get -q update \
     && apt-get -q install -y \
       libjemalloc2 \
+      libldap-2.5-0 \
       ca-certificates \
       tzdata \
     && rm -rf /var/lib/apt/lists/* \
