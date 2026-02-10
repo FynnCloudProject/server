@@ -38,6 +38,7 @@ struct AppConfig: Sendable {
     let primaryColor: TailwindColor
     let appName: String
     let appVersion: String
+    let isJwtSecretDefault: Bool
 
     static func load(for app: Application) -> AppConfig {
         let maxChunkSizeStr = Environment.get("MAX_CHUNK_SIZE") ?? "100mb"
@@ -65,6 +66,9 @@ struct AppConfig: Sendable {
             storage = .local(path: path)
         }
 
+        let jwtSecretEnv = Environment.get("JWT_SECRET")
+        let isJwtSecretDefault = jwtSecretEnv == nil
+
         return AppConfig(
             database: dbStrategy,
             storage: storage,
@@ -79,7 +83,7 @@ struct AppConfig: Sendable {
             ),
             maxBodySize: maxBodySize,
             maxChunkSize: maxChunkSize,
-            jwtSecret: Environment.get("JWT_SECRET") ?? [UInt8].random(count: 32).base64,
+            jwtSecret: jwtSecretEnv ?? [UInt8].random(count: 32).base64,
             corsAllowedOrigins: (Environment.get("CORS_ALLOWED_ORIGINS") ?? frontendURL)
                 .split(separator: ",").map(String.init),
             aws: AWSConfig(
@@ -92,7 +96,8 @@ struct AppConfig: Sendable {
             primaryColor: Environment.get("PRIMARY_COLOR")
                 .flatMap(TailwindColor.init) ?? .blue,
             appName: Environment.get("APP_NAME") ?? "FynnCloud",
-            appVersion: "1.0.0"
+            appVersion: "1.0.0",
+            isJwtSecretDefault: isJwtSecretDefault
         )
     }
 }
