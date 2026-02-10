@@ -44,7 +44,6 @@ struct MetaController: RouteCollection {
             primaryColor: req.application.config.primaryColor.rawValue
         )
     }
-
     func alerts(req: Request) async throws -> ServerAlertsResponse {
         let config = req.application.config
         let isProduction = req.application.environment == .production
@@ -54,20 +53,29 @@ struct MetaController: RouteCollection {
             alerts.append(
                 ServerAlert(
                     key: "jwtSecretDefault",
-                    severity: .warning,
+                    severity: .critical,
                     message:
-                        "JWT secret is using a random default — tokens will be invalidated on every server restart. Set the JWT_SECRET environment variable."
+                        "JWT secret is volatile. Users will be logged out on every server restart. Set JWT_SECRET."
                 ))
         }
 
-        if isProduction || true {
+        if config.ldapEnabled && config.ldapConfig.password == "JonSn0w" {
+            alerts.append(
+                ServerAlert(
+                    key: "ldapDefaultPassword",
+                    severity: .critical,
+                    message: "LDAP is using a default password. This is a high-security risk."
+                ))
+        }
+
+        if isProduction {
             if case .sqlite = config.database {
                 alerts.append(
                     ServerAlert(
                         key: "sqliteInProduction",
-                        severity: .critical,
+                        severity: .warning,
                         message:
-                            "SQLite is being used in a production environment. Consider switching to PostgreSQL."
+                            "SQLite is active. For high-concurrency production use, PostgreSQL is recommended."
                     ))
             }
 
@@ -76,20 +84,19 @@ struct MetaController: RouteCollection {
                     ServerAlert(
                         key: "corsAllowAll",
                         severity: .warning,
-                        message:
-                            "CORS is configured to allow all origins in production. Restrict allowed origins."
+                        message: "CORS allows all origins. Restrict this to your front-end domain."
                     ))
             }
-        }
 
-        if config.ldapEnabled && config.ldapConfig.password == "JonSn0w" {
-            alerts.append(
-                ServerAlert(
-                    key: "ldapDefaultPassword",
-                    severity: .warning,
-                    message:
-                        "LDAP is configured with the default bind password. Change LDAP_PASSWORD."
-                ))
+            if req.headers.first(name: "x-forwarded-proto") ?? req.url.scheme != "https" {
+                alerts.append(
+                    ServerAlert(
+                        key: "httpNotHttps",
+                        severity: .warning,
+                        message:
+                            "Insecure connection detected. Ensure your proxy or load balancer enforces HTTPS."
+                    ))
+            }
         }
 
         if config.appName == "FynnCloud" {
@@ -97,23 +104,10 @@ struct MetaController: RouteCollection {
                 ServerAlert(
                     key: "appNameDefault",
                     severity: .info,
-                    message:
-                        "App name is using the default value 'FynnCloud'. Set APP_NAME to customize."
+                    message: "You are using the default branding ('FynnCloud')."
                 ))
         }
 
-        // If http not https, try to get from proxy first then fallback to url
-        if req.headers.first(name: "x-forwarded-proto") ?? req.url.scheme != "https" {
-            alerts.append(
-                ServerAlert(
-                    key: "httpNotHttps",
-                    severity: .warning,
-                    message:
-                        "HTTP is being used in a production environment. Consider switching to HTTPS."
-                ))
-        }
-
-        return ServerAlertsResponse(
-            alerts: alerts)
+        return ServerAlertsResponse(alerts: alerts)
     }
 }
