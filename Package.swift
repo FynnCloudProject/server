@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "FynnCloudBackend",
+    name: "FynnCloudServer",
     platforms: [
         .macOS(.v13)
     ],
@@ -26,7 +26,7 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "FynnCloudBackend",
+            name: "FynnCloudServer",
             dependencies: [
                 .product(name: "Fluent", package: "fluent"),
                 .product(name: "FluentSQLiteDriver", package: "fluent-sqlite-driver"),
@@ -38,16 +38,16 @@ let package = Package(
                 .product(name: "SotoS3", package: "soto"),
                 .product(name: "SwiftDirector", package: "SwiftDirector"),
             ],
-            path: "Sources/FynnCloudBackend",
+            path: "Sources/FynnCloudServer",
             swiftSettings: swiftSettings
         ),
         .testTarget(
-            name: "FynnCloudBackendTests",
+            name: "FynnCloudServerTests",
             dependencies: [
-                .target(name: "FynnCloudBackend"),
+                .target(name: "FynnCloudServer"),
                 .product(name: "VaporTesting", package: "vapor"),
             ],
-            path: "Tests/FynnCloudBackendTests",
+            path: "Tests/FynnCloudServerTests",
             swiftSettings: swiftSettings
         ),
     ]

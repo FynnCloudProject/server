@@ -59,19 +59,19 @@ jobs:
         run: |
           if [ "${{ matrix.os-label }}" == "macos" ]; then
             # Build for a single specific arch to avoid header merging errors
-            swift build -c release --product FynnCloudBackend --static-swift-stdlib --arch ${{ matrix.arch }}
+            swift build -c release --product FynnCloudServer --static-swift-stdlib --arch ${{ matrix.arch }}
           else
             # Linux build with jemalloc
-            swift build -c release --product FynnCloudBackend --static-swift-stdlib -Xlinker -ljemalloc -Xswiftc -gnone
+            swift build -c release --product FynnCloudServer --static-swift-stdlib -Xlinker -ljemalloc -Xswiftc -gnone
           fi
 
       - name: Prepare Artifacts
         run: |
-          STAGING_DIR="FynnCloudBackend-${{ matrix.os-label }}-${{ matrix.arch }}"
+          STAGING_DIR="FynnCloudServer-${{ matrix.os-label }}-${{ matrix.arch }}"
           mkdir -p "$STAGING_DIR"
 
           # Find the binary (it might be in a subfolder depending on arch)
-          find .build -name FynnCloudBackend -type f -perm +111 -exec cp {} "$STAGING_DIR/" \;
+          find .build -name FynnCloudServer -type f -perm +111 -exec cp {} "$STAGING_DIR/" \;
 
           # Copy resources
           [ -d Public ] && cp -R Public "$STAGING_DIR/" || true

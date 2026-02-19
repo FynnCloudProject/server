@@ -1,4 +1,4 @@
-# ☁️ FynnCloud Backend
+# ☁️ FynnCloud Server
 
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![Vapor](https://img.shields.io/badge/Vapor-4.0-blue.svg)](https://vapor.codes)
@@ -46,7 +46,7 @@ The application can be configured using the following environment variables. You
 Run with full optimizations and production-level logging:
 
 ```bash
-swift run FynnCloudBackend serve --env production
+swift run FynnCloudServer serve --env production
 ```
 
 ### Development Mode
@@ -54,7 +54,7 @@ swift run FynnCloudBackend serve --env production
 Run with verbose logging and debug symbols:
 
 ```bash
-swift run FynnCloudBackend
+swift run FynnCloudServer
 ```
 
 ---
@@ -65,8 +65,8 @@ swift run FynnCloudBackend
 2. Clone the repository:
 
 ```bash
-git clone https://github.com/thilojaeggi/FynnCloudBackend.git
-cd FynnCloudBackend
+git clone https://github.com/thilojaeggi/FynnCloudServer.git
+cd FynnCloudServer
 ```
 
 3. Build the project:
@@ -78,5 +78,5 @@ swift build
 4. Run the binary:
 
 ```bash
-./build/debug/FynnCloudBackend
+./build/debug/FynnCloudServer
 ```

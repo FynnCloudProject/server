@@ -25,13 +25,13 @@ COPY . .
 # Build with build cache mount and parallel jobs
 RUN --mount=type=cache,target=/build/.build,sharing=locked \
     swift build -c release \
-        --product FynnCloudBackend \
+        --product FynnCloudServer \
         --static-swift-stdlib \
         -Xlinker -ljemalloc \
         -Xswiftc -j$(nproc) \
         -Xswiftc -gnone \
     && mkdir -p /staging \
-    && cp ".build/release/FynnCloudBackend" /staging \
+    && cp ".build/release/FynnCloudServer" /staging \
     && ([ -d /build/Public ] && cp -R /build/Public /staging/ || true) \
     && ([ -d /build/Resources ] && cp -R /build/Resources /staging/ || true)
 
@@ -69,5 +69,5 @@ USER vapor:vapor
 EXPOSE 8080
 
 # Start the Vapor service when the image is run
-ENTRYPOINT ["./FynnCloudBackend"]
+ENTRYPOINT ["./FynnCloudServer"]
 CMD ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]

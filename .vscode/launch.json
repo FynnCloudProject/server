@@ -5,20 +5,20 @@
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:FynnCloud-Backend}",
-            "name": "Debug FynnCloudBackend",
-            "target": "FynnCloudBackend",
+            "name": "Debug FynnCloudServer",
+            "target": "FynnCloudServer",
             "configuration": "debug",
-            "preLaunchTask": "swift: Build Debug FynnCloudBackend"
+            "preLaunchTask": "swift: Build Debug FynnCloudServer"
         },
         {
             "type": "swift",
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:FynnCloud-Backend}",
-            "name": "Release FynnCloudBackend",
-            "target": "FynnCloudBackend",
+            "name": "Release FynnCloudServer",
+            "target": "FynnCloudServer",
             "configuration": "release",
-            "preLaunchTask": "swift: Build Release FynnCloudBackend"
+            "preLaunchTask": "swift: Build Release FynnCloudServer"
         }
     ]
 }
