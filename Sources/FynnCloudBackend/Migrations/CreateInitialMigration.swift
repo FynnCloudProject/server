@@ -40,14 +40,13 @@ struct CreateInitialMigration: AsyncMigration {
             .create()
 
         // Seed Default Storage Tiers
-        // TODO: Reimplement since FynnCloud wasn't meant to be a self-hosted solution at first
-        let freeTier = StorageTier(name: "Free", limitBytes: 5 * 1024 * 1024 * 1024)  // 5GB
-        let proTier = StorageTier(name: "Pro", limitBytes: 50 * 1024 * 1024 * 1024)  // 50GB
-        let businessTier = StorageTier(name: "Business", limitBytes: 1024 * 1024 * 1024 * 1024)  // 1TB
+        let standardTier = StorageTier(name: "Standard", limitBytes: 5 * 1024 * 1024 * 1024)  // 5GB
+        let extraTier = StorageTier(name: "Extra", limitBytes: 50 * 1024 * 1024 * 1024)  // 50GB
+        let unlimitedTier = StorageTier(name: "Unlimited", limitBytes: 1_125_899_906_842_624)  // 1 PB = unlimited
 
-        try await freeTier.create(on: database)
-        try await proTier.create(on: database)
-        try await businessTier.create(on: database)
+        try await standardTier.create(on: database)
+        try await extraTier.create(on: database)
+        try await unlimitedTier.create(on: database)
 
     }
 
