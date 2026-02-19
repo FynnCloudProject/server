@@ -14,12 +14,12 @@ struct RegisterDTO: Content {
 }
 
 struct LoginWithOAuthDTO: Content {
-    let username: String
-    let password: String
-    let codeChallenge: String
-    let clientId: String
-    let state: String?
-    let redirectURI: String?
+    var username: String
+    var password: String
+    var codeChallenge: String
+    var clientId: String
+    var state: String?
+    var redirectURI: String?
 }
 
 struct AuthorizeDTO: Content {
