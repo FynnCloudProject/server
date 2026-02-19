@@ -21,17 +21,18 @@ struct UserPayloadAuthenticator: AsyncRequestAuthenticator {
             // Verify the JWT signature and expiration
             let payload = try await request.jwt.verify(token, as: UserPayload.self)
 
-            // REVOCATION CHECK: Verify the Grant still exists in the database
-            let grantExists =
-                try await OAuthGrant.query(on: request.db)
+            // REVOCATION CHECK & GROUP FETCH: Verify the Grant still exists and fetch up-to-date groups
+            let grant = try await OAuthGrant.query(on: request.db)
                 .filter(\.$id == payload.grantID)
-                .first() != nil
+                .with(\.$user) { user in
+                    user.with(\.$groups)
+                }
+                .first()
 
-            guard grantExists else {
+            guard grant != nil else {
                 request.logger.warning("Token valid, but Grant \(payload.grantID) was revoked")
                 return
             }
-
             // 4. Success: "Login" the payload
             request.auth.login(payload)
             request.logger.debug(
