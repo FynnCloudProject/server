@@ -4,8 +4,6 @@ import Vapor
 // MARK: - User JWT Payload
 
 struct UserPayload: JWTPayload, Authenticatable {
-    // Maps the longer Swift property names to the
-    // shortened keys used in the JWT payload.
     enum CodingKeys: String, CodingKey {
         case subject = "sub"
         case expiration = "exp"
@@ -13,16 +11,9 @@ struct UserPayload: JWTPayload, Authenticatable {
         case jti = "jti"
     }
 
-    // The "sub" (subject) claim identifies the principal that is the
-    // subject of the JWT.
     var subject: SubjectClaim
-
-    // The "exp" (expiration time) claim identifies the expiration time on
-    // or after which the JWT MUST NOT be accepted for processing.
     var expiration: ExpirationClaim
-
     var grantID: UUID
-
     var jti: IDClaim
 
     func getID() throws -> UUID {
