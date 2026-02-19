@@ -54,7 +54,7 @@ struct AppConfig: Sendable {
         {
             dbStrategy = .postgres(pgConfig)
         } else {
-            dbStrategy = .sqlite("db.sqlite")
+            dbStrategy = .sqlite(Environment.get("SQLITE_PATH") ?? "db.sqlite")
         }
 
         let storage: StorageDriver
@@ -96,7 +96,7 @@ struct AppConfig: Sendable {
             primaryColor: Environment.get("PRIMARY_COLOR")
                 .flatMap(TailwindColor.init) ?? .blue,
             appName: Environment.get("APP_NAME") ?? "FynnCloud",
-            appVersion: "0.0.1-dev",
+            appVersion: "0.1.0",
             isJwtSecretDefault: isJwtSecretDefault
         )
     }
