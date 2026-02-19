@@ -12,7 +12,6 @@ struct StorageService: Sendable {
     // MARK: - Sync Engine Helper
 
     /// Records a change in the user's sync timeline.
-    /// Uses 'FOR UPDATE' to lock the sequence and prevent collisions.
     private func recordSyncChange(
         fileID: UUID,
         userID: UUID,
@@ -20,47 +19,8 @@ struct StorageService: Sendable {
         contentUpdated: Bool = false,
         on transaction: any Database
     ) async throws {
-        // Disable globally for now as it's buggy
+        // Disabled for now as it's buggy
         return
-        let maxRetries = 3
-        var lastError: (any Error)?
-
-        for attempt in 1...maxRetries {
-            // Fetch the current highest sequence for this user
-            let lastEntry = try await SyncLog.query(on: transaction)
-                .filter(\.$user.$id == userID)
-                .sort(\.$seq, .descending)
-                .first()
-
-            let nextSeq = (lastEntry?.seq ?? 0) + 1
-
-            let log = SyncLog(
-                userID: userID,
-                fileID: fileID,
-                seq: nextSeq,
-                eventType: type,
-                contentUpdated: contentUpdated
-            )
-
-            do {
-                // Attempt to save.
-                // If another thread wrote 'nextSeq' between our 'read' and 'write',
-                // the Unique Constraint in the DB will throw an error here.
-                try await log.save(on: transaction)
-                return
-            } catch {
-                lastError = error
-                // If we hit a unique constraint violation, we loop and try again.
-                logger.warning(
-                    "Sync sequence collision for user \(userID) at seq \(nextSeq). Retry attempt \(attempt)."
-                )
-                continue
-            }
-        }
-
-        // If we exhausted retries, throw the last error encountered
-        logger.error("Failed to record sync change after \(maxRetries) attempts.")
-        throw lastError ?? Abort(.internalServerError).localized("error.generic")
     }
 
     // MARK: - Retrieval Logic
@@ -73,7 +33,6 @@ struct StorageService: Sendable {
 
         switch filter {
 
-        // Gets all files as flat list
         case .all:
             query.filter(\.$deletedAt == nil)
             query.sort(\.$updatedAt, .descending)
@@ -101,14 +60,43 @@ struct StorageService: Sendable {
             query.sort(\.$updatedAt, .descending)
             breadcrumbs = [Breadcrumb(name: "Shared", id: nil)]
 
-        case .trash:
-            query.withDeleted().filter(\.$deletedAt != nil)
-            query.sort(\.$deletedAt, .descending)
-            breadcrumbs = [Breadcrumb(name: "Trash", id: nil)]
+        case .trash(let folderID):
+            if let folderID = folderID {
+                // Browsing into a trashed folder — show children that were
+                // trashed as part of the same action (matching deleted_at).
+                // Independently trashed children live at the trash root instead.
+                guard
+                    let folder = try await FileMetadata.query(on: db)
+                        .withDeleted()
+                        .filter(\.$id == folderID)
+                        .filter(\.$owner.$id == userID)
+                        .first(),
+                    let folderDeletedAt = folder.deletedAt
+                else {
+                    throw Abort(.notFound).localized("error.generic")
+                }
+
+                parentID = folderID
+                query.withDeleted()
+                    .filter(\.$parent.$id == folderID)
+                    .filter(\.$deletedAt == folderDeletedAt)
+                query.sort(\.$isDirectory, .descending).sort(\.$filename, .ascending)
+                breadcrumbs = try await getTrashBreadcrumbs(for: folderID, userID: userID)
+            } else {
+                // Trash root — only show top-level trashed items
+                // (items whose parent is nil or whose parent is NOT deleted)
+                let trashRoots = try await fetchTrashRoots(userID: userID)
+                breadcrumbs = [Breadcrumb(name: "Trash", id: nil)]
+                logger.info("Queried trash roots for user \(userID)")
+                return FileIndexDTO(
+                    files: trashRoots,
+                    parentID: nil,
+                    breadcrumbs: breadcrumbs
+                )
+            }
         }
 
         let files = try await query.all()
-        // Log what was queried so user id or parent id can be used to identify the query
         logger.info(
             "Queried files for user \(userID) and parent \((parentID?.uuidString) ?? "Root")"
         )
@@ -119,7 +107,6 @@ struct StorageService: Sendable {
         )
     }
 
-    // Basically an alias for validateOwnership just make it clearer it returns metadata
     func getMetadata(for id: UUID, userID: UUID) async throws -> FileMetadata {
         let metadata = try await validateOwnership(fileID: id, userID: userID)
         return metadata
@@ -139,7 +126,7 @@ struct StorageService: Sendable {
     func upload(
         filename: String,
         stream: Request.Body,
-        claimedSize: Int64,  // Renamed from 'size'
+        claimedSize: Int64,
         contentType: String,
         parentID: UUID?,
         userID: UUID,
@@ -148,37 +135,30 @@ struct StorageService: Sendable {
         let fileID = UUID()
         try await ensureUniqueName(name: filename, parentID: parentID, userID: userID)
 
-        // SECURITY: Add a reasonable buffer (e.g., 5%) or fixed amount for overhead
-        // This prevents immediate failure due to encoding differences
-        let maxAllowedSize = claimedSize + max(claimedSize / 20, 1024 * 1024)  // 5% or 1MB buffer
+        let maxAllowedSize = claimedSize + max(claimedSize / 20, 1024 * 1024)
 
-        // Validate and Reserve Quota based on claimed size
         try await reserveQuota(amount: claimedSize, userID: userID)
 
-        // Physical Write with size enforcement
         let actualSize: Int64
         do {
             actualSize = try await provider.save(
                 stream: stream,
                 id: fileID,
                 userID: userID,
-                maxSize: maxAllowedSize,  // Enforce maximum
+                maxSize: maxAllowedSize,
                 on: eventLoop
             )
         } catch {
-            // FAILURE RECOVERY: If the disk write fails, decrement quota
             logger.error("Upload failed for user \(userID). Reclaiming \(claimedSize) bytes.")
             try? await decrementQuota(amount: claimedSize, userID: userID)
             throw error
         }
 
-        // SECURITY CHECK: Verify actual size is within acceptable range
-        let tolerance: Int64 = 1024 * 1024  // 1MB tolerance for encoding overhead
+        let tolerance: Int64 = 1024 * 1024
         if actualSize > claimedSize + tolerance {
             logger.error(
                 "Size mismatch: claimed \(claimedSize) bytes, actual \(actualSize) bytes"
             )
-            // Clean up the file
             try? await provider.delete(id: fileID, userID: userID)
             try? await decrementQuota(amount: claimedSize, userID: userID)
             throw Abort(
@@ -190,7 +170,6 @@ struct StorageService: Sendable {
             )
         }
 
-        // If actual size is significantly less, adjust quota
         let sizeDelta = claimedSize - actualSize
         if sizeDelta > tolerance {
             try? await decrementQuota(amount: sizeDelta, userID: userID)
@@ -199,12 +178,11 @@ struct StorageService: Sendable {
             )
         }
 
-        // COMMIT: Save Metadata with ACTUAL size
         let metadata = FileMetadata(
             id: fileID,
             filename: filename,
             contentType: contentType,
-            size: actualSize,  // Use actual, not claimed
+            size: actualSize,
             parentID: parentID,
             ownerID: userID,
             lastModified: lastModified != nil
@@ -217,8 +195,6 @@ struct StorageService: Sendable {
                 fileID: fileID, userID: userID, type: .upsert, contentUpdated: true, on: db)
             return metadata
         } catch {
-            // If metadata fails to save, we have a "Ghost File" on disk.
-            // Clean up disk and quota.
             try? await provider.delete(id: fileID, userID: userID)
             try? await decrementQuota(amount: actualSize, userID: userID)
             throw error
@@ -228,12 +204,11 @@ struct StorageService: Sendable {
     func update(
         fileID: UUID,
         stream: Request.Body,
-        claimedSize: Int64,  // Renamed from 'newSize'
+        claimedSize: Int64,
         contentType: String,
         userID: UUID,
         lastModified: Int64? = nil
     ) async throws -> FileMetadata {
-        // Validate ownership and existence
         let existingFile = try await validateOwnership(fileID: fileID, userID: userID)
 
         guard !existingFile.isDirectory else {
@@ -244,12 +219,10 @@ struct StorageService: Sendable {
         let estimatedDelta = claimedSize - existingFile.size
         let maxAllowedSize = claimedSize + max(claimedSize / 20, 1024 * 1024)
 
-        // Adjust Quota (only if the file is estimated to be larger)
         if estimatedDelta > 0 {
             try await reserveQuota(amount: estimatedDelta, userID: userID)
         }
 
-        // Physical Write (Overwrite)
         let actualSize: Int64
         do {
             actualSize = try await provider.save(
@@ -260,28 +233,22 @@ struct StorageService: Sendable {
                 on: eventLoop
             )
         } catch {
-            // Rollback quota if we reserved it and failed
             if estimatedDelta > 0 {
                 try? await decrementQuota(amount: estimatedDelta, userID: userID)
             }
             throw error
         }
 
-        // Calculate actual delta
         let actualDelta = actualSize - existingFile.size
 
-        // Adjust quota based on actual size difference
         if actualDelta > estimatedDelta {
-            // Need more quota than we reserved
             let additionalNeeded = actualDelta - estimatedDelta
             try await reserveQuota(amount: additionalNeeded, userID: userID)
         } else if actualDelta < estimatedDelta {
-            // Need less quota than we reserved, return the difference
             let toReturn = estimatedDelta - actualDelta
             try? await decrementQuota(amount: toReturn, userID: userID)
         }
 
-        // Update Metadata with actual size
         existingFile.size = actualSize
         existingFile.contentType = contentType
         existingFile.updatedAt = Date()
@@ -296,23 +263,18 @@ struct StorageService: Sendable {
                 fileID: fileID, userID: userID, type: .upsert, contentUpdated: true, on: db)
             return existingFile
         } catch {
-            // Rollback changes on metadata save failure
             try? await decrementQuota(amount: actualDelta, userID: userID)
             throw error
         }
     }
 
     func rename(fileID: UUID, newName: String, userID: UUID) async throws -> FileMetadata {
-        // Fetch the file and validate ownership
         let file = try await validateOwnership(fileID: fileID, userID: userID)
 
-        // If name hasn't changed, just return it
         if file.filename == newName { return file }
 
-        // Ensure the new name isn't taken in the current folder
         try await ensureUniqueName(name: newName, parentID: file.$parent.id, userID: userID)
 
-        // Update and save
         file.filename = newName
         try await file.save(on: db)
 
@@ -322,13 +284,10 @@ struct StorageService: Sendable {
     }
 
     func move(fileID: UUID, newParentID: UUID?, userID: UUID) async throws -> FileMetadata {
-        // Fetch the file and validate ownership
         let file = try await validateOwnership(fileID: fileID, userID: userID)
 
-        // If moving to the same folder, do nothing
         if file.$parent.id == newParentID { return file }
 
-        // Ensure the new parent is valid and owned by the user
         if let pID = newParentID {
             let parent = try await validateOwnership(fileID: pID, userID: userID)
             guard parent.isDirectory else {
@@ -337,10 +296,8 @@ struct StorageService: Sendable {
             }
         }
 
-        // Ensure the new name isn't taken in the target folder
         try await ensureUniqueName(name: file.filename, parentID: newParentID, userID: userID)
 
-        // Update and save
         file.$parent.id = newParentID
         try await file.save(on: db)
 
@@ -361,10 +318,18 @@ struct StorageService: Sendable {
             throw Abort(.notFound).localized("files.alerts.restoreFailed")
         }
 
+        guard let deletedAt = file.deletedAt else {
+            throw Abort(.badRequest, reason: "File is not in trash.").localized(
+                "files.alerts.restoreFailed")
+        }
+
         // Check if the parent folder exists (and is active/not in trash)
         if let parentID = file.$parent.id {
-            let parentExists = try await FileMetadata.find(parentID, on: db) != nil
-            if !parentExists {
+            let parent = try await FileMetadata.query(on: db)
+                .filter(\.$id == parentID)
+                .first()
+            // If parent doesn't exist or is itself deleted, move to root
+            if parent == nil {
                 file.$parent.id = nil
             }
         }
@@ -396,8 +361,17 @@ struct StorageService: Sendable {
 
         file.filename = currentName
 
+        // Restore the file itself
         try await file.restore(on: db)
         try await file.save(on: db)
+
+        // Recursively restore descendants that were trashed at the same time.
+        // Items that were independently trashed before this folder (different deletedAt)
+        // will remain in the trash.
+        if file.isDirectory {
+            try await restoreDescendants(
+                of: try file.requireID(), userID: userID, deletedAt: deletedAt)
+        }
 
         logger.info(
             "File restored from trash",
@@ -429,11 +403,9 @@ struct StorageService: Sendable {
             ownerID: userID
         )
 
-        // Wrap in a transaction to be safe and ensure the ID is available
         try await db.transaction { tx in
             try await dir.save(on: tx)
 
-            // Use requireID() to ensure we have the UUID generated by the DB save
             let dirID = try dir.requireID()
 
             logger.info("Directory created with ID: \(dirID)")
@@ -450,10 +422,21 @@ struct StorageService: Sendable {
         return dir
     }
 
-    // Soft delete
+    /// Soft delete a file or directory, recursively marking all descendants as deleted.
     func moveToTrash(fileID: UUID, userID: UUID) async throws {
         let file = try await validateOwnership(fileID: fileID, userID: userID)
-        try await file.delete(on: db)
+        let now = Date()
+
+        // If it's a directory, recursively soft-delete all non-deleted descendants first
+        // so they share the same deletedAt timestamp (used for selective restore).
+        if file.isDirectory {
+            try await softDeleteDescendants(of: fileID, userID: userID, deletedAt: now)
+        }
+
+        // Soft-delete the root item itself via Fluent.
+        // We set deletedAt explicitly so it matches the descendants' timestamp.
+        file.deletedAt = now
+        try await file.save(on: db)
 
         try await recordSyncChange(
             fileID: fileID, userID: userID, type: .delete, contentUpdated: false, on: db)
@@ -507,19 +490,41 @@ struct StorageService: Sendable {
             throw Abort(.internalServerError).localized("error.generic")
         }
 
-        // We use a subquery to check the limit against the current usage + the new file size.
-        // This prevents race conditions without needing a manual 'lock' on the row.
+        let user = try await User.query(on: db)
+            .filter(\.$id == userID)
+            .with(\.$tier)
+            .first()
+
+        guard let user = user else {
+            throw Abort(.notFound).localized("upload.error.quotaExceeded")
+        }
+
+        let userTierLimit = user.tier?.limitBytes ?? 0
+
+        var groupMaxLimit: Int64 = 0
+
+        let groupLimitRow = try await sql.raw(
+            """
+                SELECT MAX(t.limit_bytes) as max_limit
+                FROM user_groups ug 
+                JOIN groups g ON ug.group_id = g.id 
+                JOIN storage_tiers t ON g.tier_id = t.id 
+                WHERE ug.user_id = \(bind: userID)
+            """
+        ).first()
+
+        if let row = groupLimitRow {
+            groupMaxLimit = try row.decode(column: "max_limit", as: Int64?.self) ?? 0
+        }
+
+        let effectiveLimit = max(userTierLimit, groupMaxLimit)
+
         let result = try await sql.raw(
             """
                 UPDATE users 
                 SET current_storage_usage = current_storage_usage + \(bind: amount)
                 WHERE id = \(bind: userID) 
-                AND (
-                    SELECT (u.current_storage_usage + \(bind: amount)) <= t.limit_bytes 
-                    FROM users u 
-                    JOIN storage_tiers t ON u.tier_id = t.id 
-                    WHERE u.id = \(bind: userID)
-                )
+                AND (current_storage_usage + \(bind: amount)) <= \(bind: effectiveLimit)
                 RETURNING id;
             """
         ).first()
@@ -536,7 +541,6 @@ struct StorageService: Sendable {
         isIncrement: Bool,
         on connection: (any Database)? = nil
     ) async throws {
-        // Use the passed connection or fall back to the main pool
         let activeDB = connection ?? self.db
         guard let sql = activeDB as? any SQLDatabase else { return }
 
@@ -577,6 +581,119 @@ struct StorageService: Sendable {
         return crumbs
     }
 
+    /// Builds breadcrumbs for navigating within the trash view.
+    /// Walks up the ancestor chain until it finds a non-deleted parent (the trash boundary).
+    private func getTrashBreadcrumbs(for folderID: UUID, userID: UUID) async throws -> [Breadcrumb]
+    {
+        var crumbs: [Breadcrumb] = [Breadcrumb(name: "Trash", id: nil)]
+        var currentID: UUID? = folderID
+        var pathCrumbs: [Breadcrumb] = []
+
+        while let id = currentID {
+            guard
+                let dir = try await FileMetadata.query(on: db)
+                    .withDeleted()
+                    .filter(\.$id == id)
+                    .filter(\.$owner.$id == userID)
+                    .first()
+            else { break }
+
+            pathCrumbs.insert(Breadcrumb(name: dir.filename, id: dir.id), at: 0)
+
+            // Stop climbing once we reach an item whose parent is not in trash
+            if let parentID = dir.$parent.id {
+                let parent = try await FileMetadata.query(on: db)
+                    .withDeleted()
+                    .filter(\.$id == parentID)
+                    .filter(\.$owner.$id == userID)
+                    .first()
+                if parent == nil || parent?.deletedAt == nil {
+                    break
+                }
+                currentID = parentID
+            } else {
+                break
+            }
+        }
+
+        crumbs.append(contentsOf: pathCrumbs)
+        return crumbs
+    }
+
+    /// Fetches top-level trash items. An item appears at the trash root if:
+    /// - It has no parent, OR
+    /// - Its parent is not deleted, OR
+    /// - Its deleted_at differs from its parent's (independently trashed)
+    private func fetchTrashRoots(userID: UUID) async throws -> [FileMetadata] {
+        guard let sql = db as? any SQLDatabase else { return [] }
+        return try await sql.raw(
+            """
+            SELECT f.* FROM file_metadata f
+            LEFT JOIN file_metadata p ON f.parent_id = p.id
+            WHERE f.owner_id = \(bind: userID)
+            AND f.deleted_at IS NOT NULL
+            AND (
+                f.parent_id IS NULL
+                OR p.deleted_at IS NULL
+                OR f.deleted_at != p.deleted_at
+            )
+            ORDER BY f.deleted_at DESC
+            """
+        ).all(decodingFluent: FileMetadata.self)
+    }
+
+    /// Recursively soft-deletes all non-deleted descendants of a directory.
+    /// Only touches items that are not already in trash (deletedAt IS NULL),
+    /// preserving the original deletedAt of independently trashed items.
+    private func softDeleteDescendants(
+        of parentID: UUID, userID: UUID, deletedAt: Date
+    ) async throws {
+        guard let sql = db as? any SQLDatabase else { return }
+
+        try await sql.raw(
+            """
+            WITH RECURSIVE descendants AS (
+                SELECT id FROM file_metadata
+                WHERE parent_id = \(bind: parentID)
+                AND owner_id = \(bind: userID)
+                AND deleted_at IS NULL
+                UNION ALL
+                SELECT f.id FROM file_metadata f
+                INNER JOIN descendants d ON f.parent_id = d.id
+                WHERE f.owner_id = \(bind: userID)
+                AND f.deleted_at IS NULL
+            )
+            UPDATE file_metadata SET deleted_at = \(bind: deletedAt)
+            WHERE id IN (SELECT id FROM descendants)
+            """
+        ).run()
+    }
+
+    /// Recursively restores descendants that were trashed as part of the same action
+    /// (matching deleted_at timestamp). Independently trashed items remain in trash.
+    private func restoreDescendants(
+        of parentID: UUID, userID: UUID, deletedAt: Date
+    ) async throws {
+        guard let sql = db as? any SQLDatabase else { return }
+
+        try await sql.raw(
+            """
+            WITH RECURSIVE descendants AS (
+                SELECT id FROM file_metadata
+                WHERE parent_id = \(bind: parentID)
+                AND owner_id = \(bind: userID)
+                UNION ALL
+                SELECT f.id FROM file_metadata f
+                INNER JOIN descendants d ON f.parent_id = d.id
+                WHERE f.owner_id = \(bind: userID)
+            )
+            UPDATE file_metadata SET deleted_at = NULL
+            WHERE id IN (SELECT id FROM descendants)
+            AND deleted_at = \(bind: deletedAt)
+            """
+        ).run()
+    }
+
     private func fetchAllDescendants(of parentID: UUID, userID: UUID) async throws -> [FileMetadata]
     {
         guard let sql = db as? any SQLDatabase else { return [] }
@@ -615,7 +732,6 @@ extension StorageService {
 
     // MARK: - Multipart Upload Operations
 
-    /// Response from initiating a multipart upload
     struct InitiatedUploadSession: Sendable {
         let sessionID: UUID
         let fileID: UUID
@@ -629,7 +745,6 @@ extension StorageService {
         let userID: UUID
     }
 
-    /// Initiate a multipart upload session (creates minimal session for cleanup/audit)
     func initiateMultipartUpload(
         filename: String,
         contentType: String,
@@ -646,15 +761,12 @@ extension StorageService {
         try await ensureUniqueName(name: filename, parentID: parentID, userID: userID)
         try await reserveQuota(amount: totalSize, userID: userID)
 
-        // Generate file ID (but don't create FileMetadata yet)
         let fileID = UUID()
         let sessionID = UUID()
         let maxChunkSize = request.application.config.maxChunkSize
 
-        // Initiate upload with storage provider
         let uploadID = try await provider.initiateMultipartUpload(id: fileID, userID: userID)
 
-        // Create minimal session in database (for cleanup/audit only)
         let session = MultipartUploadSession(
             id: sessionID,
             fileID: fileID,
@@ -662,7 +774,7 @@ extension StorageService {
             userID: userID,
             filename: filename,
             totalSize: totalSize,
-            expiresAt: Date().addingTimeInterval(86400)  // 24 hours
+            expiresAt: Date().addingTimeInterval(86400)
         )
 
         try await session.save(on: db)
@@ -677,7 +789,6 @@ extension StorageService {
             ]
         )
 
-        // Return full session data for JWT (all metadata in token)
         return InitiatedUploadSession(
             sessionID: sessionID,
             fileID: fileID,
@@ -692,7 +803,6 @@ extension StorageService {
         )
     }
 
-    /// Upload a single part - STATELESS: No DB operations, just streams to provider
     func uploadPartWithToken(
         fileID: UUID,
         uploadID: String,
@@ -702,12 +812,10 @@ extension StorageService {
         size: Int64
     ) async throws -> CompletedPart {
 
-        // Validate part number (S3 allows 1-10000)
         guard partNumber > 0 && partNumber <= 10000 else {
             throw Abort(.badRequest, reason: "Part number must be between 1 and 10000")
         }
 
-        // Upload the part to storage provider - NO DB operations!
         let completedPart = try await provider.uploadPart(
             id: fileID,
             userID: userID,
@@ -731,7 +839,6 @@ extension StorageService {
         return completedPart
     }
 
-    /// Complete the multipart upload - accepts parts from client, deletes session
     func completeMultipartUploadWithToken(
         sessionID: UUID,
         fileID: UUID,
@@ -745,7 +852,6 @@ extension StorageService {
         parts: [CompletedPart]
     ) async throws -> FileMetadata {
 
-        // SECURITY: Prevent double-completion - check if this fileID already exists
         if let existing = try await FileMetadata.find(fileID, on: db) {
             logger.warning(
                 "Attempted double-completion of upload",
@@ -759,12 +865,10 @@ extension StorageService {
             throw Abort(.conflict, reason: "Upload already completed")
         }
 
-        // Validate parts array
         guard !parts.isEmpty else {
             throw Abort(.badRequest, reason: "No parts provided")
         }
 
-        // Validate sequential parts (1, 2, 3, ...)
         let sortedParts = parts.sorted { $0.partNumber < $1.partNumber }
         let expectedParts = Set(1...sortedParts.count)
         let actualParts = Set(sortedParts.map { $0.partNumber })
@@ -773,7 +877,6 @@ extension StorageService {
             throw Abort(.badRequest, reason: "Missing or duplicate parts - upload incomplete")
         }
 
-        // Complete with provider (provider validates ETags)
         try await provider.completeMultipartUpload(
             id: fileID,
             userID: userID,
@@ -781,7 +884,6 @@ extension StorageService {
             parts: sortedParts
         )
 
-        // Create FileMetadata
         let metadata = FileMetadata(
             id: fileID,
             filename: filename,
@@ -795,7 +897,6 @@ extension StorageService {
 
         try await metadata.save(on: db)
 
-        // Record sync change for the new file
         try await recordSyncChange(
             fileID: fileID,
             userID: userID,
@@ -804,7 +905,6 @@ extension StorageService {
             on: db
         )
 
-        // Delete session record (cleanup)
         if let session = try await MultipartUploadSession.find(sessionID, on: db) {
             try await session.delete(on: db)
         }
@@ -822,7 +922,6 @@ extension StorageService {
         return metadata
     }
 
-    /// Abort a multipart upload (uses JWT metadata + deletes session)
     func abortMultipartUpload(
         fileID: UUID,
         uploadID: String,
@@ -830,17 +929,14 @@ extension StorageService {
         totalSize: Int64,
         userID: UUID
     ) async throws {
-        // Reclaim the reserved quota
         try? await decrementQuota(amount: totalSize, userID: userID)
 
-        // Abort with storage provider (cleans up chunks)
         try? await provider.abortMultipartUpload(
             id: fileID,
             userID: userID,
             uploadID: uploadID,
         )
 
-        // Delete session record (cleanup)
         if let session = try await MultipartUploadSession.find(sessionID, on: db) {
             try await session.delete(on: db)
         }
@@ -863,7 +959,7 @@ extension StorageService {
         case all
         case favorites
         case recent
-        case trash
+        case trash(parentID: UUID?)
         case shared
     }
 }
