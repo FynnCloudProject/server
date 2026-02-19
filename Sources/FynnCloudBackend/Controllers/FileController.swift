@@ -69,7 +69,8 @@ struct FileController: RouteCollection {
 
     func trash(req: Request) async throws -> FileIndexDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
-        return try await req.storage.list(filter: .trash, userID: userID)
+        let parentID = try? req.query.get(UUID.self, at: "parentID")
+        return try await req.storage.list(filter: .trash(parentID: parentID), userID: userID)
     }
 
     func recent(req: Request) async throws -> FileIndexDTO {
@@ -103,7 +104,7 @@ struct FileController: RouteCollection {
         guard let contentLength = req.headers.first(name: .contentLength).flatMap(Int64.init),
             contentLength > 0
         else {
-            throw Abort(.lengthRequired).localized("upload.error.unknown")
+            throw Abort(.lengthRequired).localized(LocalizationKeys.Common.Error.Generic)
         }
 
         let metadata = try await req.storage.upload(
@@ -149,7 +150,7 @@ struct FileController: RouteCollection {
             let lastModified = req.query[Int64.self, at: "lastModified"]
         else {
             throw Abort(.badRequest, reason: "Missing required query parameters").localized(
-                "upload.error.unknown")
+                LocalizationKeys.Common.Error.Generic)
         }
 
         let metadata = try await req.storage.update(
@@ -250,7 +251,7 @@ struct FileController: RouteCollection {
 
         guard let fileID = req.parameters.get("fileID", as: UUID.self)
         else {
-            throw Abort(.notFound).localized("files.alerts.restoreFailed")
+            throw Abort(.notFound).localized(LocalizationKeys.Files.Error.RestoreFailed)
         }
 
         return try await req.storage.restore(fileID: fileID, userID: userID)
@@ -265,7 +266,7 @@ struct FileController: RouteCollection {
                 .filter(\.$owner.$id == userID)
                 .first()
         else {
-            throw Abort(.notFound).localized("error.generic")
+            throw Abort(.notFound).localized(LocalizationKeys.Common.Error.Generic)
         }
 
         if let input = try? req.content.decode(ToggleFavoriteInput.self), let val = input.isFavorite
