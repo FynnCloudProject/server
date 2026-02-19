@@ -69,8 +69,17 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateOAuthGrant())
     app.migrations.add(UpdateGrantForRotation())
     app.migrations.add(CreateMultipartUploadSessions())
+    app.migrations.add(CreateGroups())
+    app.migrations.add(CreateAppSettings())
+    app.migrations.add(UpdateUnlimitedTier())
+    app.migrations.add(AddIsAdminToGroups())
+    app.migrations.add(LowercaseUsernames())
+    app.migrations.add(AddIndicesToFileMetadata())
 
     try await app.autoMigrate()
+
+    app.settings = SettingsService(database: app.db)
+
     try routes(app)
 }
 
@@ -90,39 +99,77 @@ private func configureCORS(_ app: Application, config: AppConfig) {
     )
     app.middleware.use(CORSMiddleware(configuration: corsConfiguration), at: .beginning)
 }
-
 private func configureErrorMiddleware(_ app: Application) {
+    let environment = app.environment
+
     app.middleware.use(
         ErrorMiddleware { req, error in
             let status: HTTPResponseStatus
             let reason: String
-            let headers: HTTPHeaders
+            let source: ErrorSource
+            var headers: HTTPHeaders
             let localizationKey: String?
 
-            if let localizedError = error as? LocalizedAbort {
-                status = localizedError.status
-                reason = localizedError.reason
-                headers = localizedError.headers
+            switch error {
+            case let localizedError as LocalizedAbort:
+                (reason, status, headers, source) = (
+                    localizedError.reason, localizedError.status, localizedError.headers, .capture()
+                )
                 localizationKey = localizedError.localizationKey
-            } else if let abort = error as? (any AbortError) {
-                status = abort.status
-                reason = abort.reason
-                headers = abort.headers
+
+            case let debugAbort as (any DebuggableError & AbortError):
+                (reason, status, headers, source) = (
+                    debugAbort.reason, debugAbort.status, debugAbort.headers,
+                    debugAbort.source ?? .capture()
+                )
                 localizationKey = "error.generic"
-            } else {
-                status = .internalServerError
-                reason =
-                    req.application.environment == .production
-                    ? "An unexpected error occurred."
-                    : String(reflecting: error)
-                headers = [:]
+
+            case let abort as any AbortError:
+                (reason, status, headers, source) = (
+                    abort.reason, abort.status, abort.headers, .capture()
+                )
+                localizationKey = "error.generic"
+
+            case let debugErr as any DebuggableError:
+                (reason, status, headers, source) = (
+                    debugErr.reason, .internalServerError, [:], debugErr.source ?? .capture()
+                )
+                localizationKey = "error.generic"
+
+            default:
+                reason = environment.isRelease ? "Something went wrong." : String(describing: error)
+                (status, headers, source) = (.internalServerError, [:], .capture())
                 localizationKey = "error.generic"
             }
 
-            let response = Response(status: status, headers: headers)
-            var body: [String: String] = ["error": "true", "reason": reason]
-            if let key = localizationKey { body["localizationKey"] = key }
-            try? response.content.encode(body)
-            return response
+            req.logger.report(
+                error: error,
+                metadata: [
+                    "method": "\(req.method.rawValue)",
+                    "url": "\(req.url.string)",
+                    "userAgent": .array(req.headers["User-Agent"].map { "\($0)" }),
+                ],
+                file: source.file,
+                function: source.function,
+                line: source.line)
+
+            let body: Response.Body
+            do {
+                var errorBody: [String: String] = ["error": "true", "reason": reason]
+                if let key = localizationKey { errorBody["localizationKey"] = key }
+
+                let encoder = try ContentConfiguration.global.requireEncoder(for: .json)
+                var byteBuffer = req.byteBufferAllocator.buffer(capacity: 0)
+                try encoder.encode(errorBody, to: &byteBuffer, headers: &headers)
+
+                body = .init(buffer: byteBuffer, byteBufferAllocator: req.byteBufferAllocator)
+            } catch {
+                body = .init(
+                    string: "Oops: \(String(describing: error))\nWhile encoding error: \(reason)",
+                    byteBufferAllocator: req.byteBufferAllocator)
+                headers.contentType = .plainText
+            }
+
+            return Response(status: status, headers: headers, body: body)
         })
 }
