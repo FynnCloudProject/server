@@ -113,7 +113,7 @@ struct MetaController: RouteCollection {
                 ))
         }
 
-        if config.ldapEnabled && config.ldapConfig.password == "JonSn0w" {
+        if config.ldapEnabled && config.ldapConfig.password == "default" {
             alerts.append(
                 ServerAlert(
                     key: LocalizationKeys.Admin.Alerts.LdapDefaultPassword,
