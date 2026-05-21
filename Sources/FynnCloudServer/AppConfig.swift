@@ -79,7 +79,7 @@ struct AppConfig: Sendable {
                 useSSL: Environment.get("LDAP_USE_SSL") == "true",
                 baseDN: Environment.get("LDAP_BASE_DN") ?? "dc=my-company,dc=com",
                 bindDN: Environment.get("LDAP_BIND_DN") ?? "cn=admin,dc=my-company,dc=com",
-                password: Environment.get("LDAP_PASSWORD") ?? "JonSn0w"
+                password: Environment.get("LDAP_PASSWORD") ?? "default"
             ),
             maxBodySize: maxBodySize,
             maxChunkSize: maxChunkSize,
