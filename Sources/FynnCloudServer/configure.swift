@@ -9,7 +9,6 @@ import Vapor
 public func configure(_ app: Application) async throws {
     let config = AppConfig.load(for: app)
     app.config = config
-
     app.routes.defaultMaxBodySize = config.maxBodySize
     configureCORS(app, config: config)
     configureErrorMiddleware(app)
@@ -75,6 +74,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(AddIsAdminToGroups())
     app.migrations.add(LowercaseUsernames())
     app.migrations.add(AddIndicesToFileMetadata())
+    app.migrations.add(AddTrashGroupToFileMetadata())
 
     if Environment.get("AUTO_MIGRATE") == "true" {
         try await app.autoMigrate()
