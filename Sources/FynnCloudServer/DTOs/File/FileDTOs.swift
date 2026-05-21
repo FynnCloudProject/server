@@ -15,6 +15,9 @@ struct FileIndexDTO: Content {
 struct Breadcrumb: Content {
     var name: String
     var id: UUID?
+    var labelKey: String?
+    var icon: String?
+    var path: String?
 }
 
 struct MoveFileInput: Content {
