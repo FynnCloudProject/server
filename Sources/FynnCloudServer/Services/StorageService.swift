@@ -36,7 +36,10 @@ struct StorageService: Sendable {
         case .all:
             query.filter(\.$deletedAt == nil)
             query.sort(\.$updatedAt, .descending)
-            breadcrumbs = [Breadcrumb(name: "All", id: nil)]
+            breadcrumbs = [
+                Breadcrumb(
+                    name: "Home", id: nil, labelKey: "navigation.allFiles", icon: "home", path: "/")
+            ]
 
         case .folder(let id):
             parentID = id
@@ -48,22 +51,34 @@ struct StorageService: Sendable {
         case .favorites:
             query.filter(\.$isFavorite == true).filter(\.$deletedAt == nil)
             query.sort(\.$updatedAt, .descending)
-            breadcrumbs = [Breadcrumb(name: "Favorites", id: nil)]
+            breadcrumbs = [
+                Breadcrumb(
+                    name: "Favorites", id: nil, labelKey: "navigation.favorites", icon: "star",
+                    path: "/favorites")
+            ]
 
         case .recent:
             query.filter(\.$deletedAt == nil).filter(\.$isDirectory == false)
             query.sort(\.$updatedAt, .descending).range(0..<50)
-            breadcrumbs = [Breadcrumb(name: "Recent", id: nil)]
+            breadcrumbs = [
+                Breadcrumb(
+                    name: "Recent", id: nil, labelKey: "navigation.recent", icon: "clock",
+                    path: "/recent")
+            ]
 
         case .shared:
             query.filter(\.$isShared == true).filter(\.$deletedAt == nil)
             query.sort(\.$updatedAt, .descending)
-            breadcrumbs = [Breadcrumb(name: "Shared", id: nil)]
+            breadcrumbs = [
+                Breadcrumb(
+                    name: "Shared", id: nil, labelKey: "navigation.shared", icon: "share",
+                    path: "/shared")
+            ]
 
         case .trash(let folderID):
             if let folderID = folderID {
                 // Browsing into a trashed folder — show children that were
-                // trashed as part of the same action (matching deleted_at).
+                // trashed as part of the same action (matching trash_group_id).
                 // Independently trashed children live at the trash root instead.
                 guard
                     let folder = try await FileMetadata.query(on: db)
@@ -71,7 +86,7 @@ struct StorageService: Sendable {
                         .filter(\.$id == folderID)
                         .filter(\.$owner.$id == userID)
                         .first(),
-                    let folderDeletedAt = folder.deletedAt
+                    let folderTrashGroupID = folder.trashGroupID
                 else {
                     throw Abort(.notFound).localized("error.generic")
                 }
@@ -79,14 +94,18 @@ struct StorageService: Sendable {
                 parentID = folderID
                 query.withDeleted()
                     .filter(\.$parent.$id == folderID)
-                    .filter(\.$deletedAt == folderDeletedAt)
+                    .filter(\.$trashGroupID == folderTrashGroupID)
                 query.sort(\.$isDirectory, .descending).sort(\.$filename, .ascending)
                 breadcrumbs = try await getTrashBreadcrumbs(for: folderID, userID: userID)
             } else {
                 // Trash root — only show top-level trashed items
                 // (items whose parent is nil or whose parent is NOT deleted)
                 let trashRoots = try await fetchTrashRoots(userID: userID)
-                breadcrumbs = [Breadcrumb(name: "Trash", id: nil)]
+                breadcrumbs = [
+                    Breadcrumb(
+                        name: "Trash", id: nil, labelKey: "navigation.trash", icon: "trash",
+                        path: "/trash")
+                ]
                 logger.info("Queried trash roots for user \(userID)")
                 return FileIndexDTO(
                     files: trashRoots,
@@ -318,20 +337,24 @@ struct StorageService: Sendable {
             throw Abort(.notFound).localized("files.alerts.restoreFailed")
         }
 
-        guard let deletedAt = file.deletedAt else {
+        guard let trashGroupID = file.trashGroupID else {
             throw Abort(.badRequest, reason: "File is not in trash.").localized(
                 "files.alerts.restoreFailed")
         }
 
-        // Check if the parent folder exists (and is active/not in trash)
-        if let parentID = file.$parent.id {
+        // Restore to original location if possible, otherwise root
+        if let originalParentID = file.originalParentID {
             let parent = try await FileMetadata.query(on: db)
-                .filter(\.$id == parentID)
+                .filter(\.$id == originalParentID)
                 .first()
-            // If parent doesn't exist or is itself deleted, move to root
+            // If original parent doesn't exist or is itself deleted, move to root
             if parent == nil {
                 file.$parent.id = nil
+            } else {
+                file.$parent.id = originalParentID
             }
+        } else {
+            file.$parent.id = nil
         }
 
         // Check for name conflict and rename if necessary
@@ -362,15 +385,17 @@ struct StorageService: Sendable {
         file.filename = currentName
 
         // Restore the file itself
-        try await file.restore(on: db)
+        file.deletedAt = nil
+        file.trashGroupID = nil
+        file.originalParentID = nil
         try await file.save(on: db)
 
-        // Recursively restore descendants that were trashed at the same time.
-        // Items that were independently trashed before this folder (different deletedAt)
+        // Recursively restore descendants that were trashed as part of the same action.
+        // Items that were independently trashed (different trashGroupID)
         // will remain in the trash.
         if file.isDirectory {
             try await restoreDescendants(
-                of: try file.requireID(), userID: userID, deletedAt: deletedAt)
+                of: try file.requireID(), userID: userID, trashGroupID: trashGroupID)
         }
 
         logger.info(
@@ -426,16 +451,20 @@ struct StorageService: Sendable {
     func moveToTrash(fileID: UUID, userID: UUID) async throws {
         let file = try await validateOwnership(fileID: fileID, userID: userID)
         let now = Date()
+        let trashGroupID = UUID()
+
+        // Remember original location for restore
+        file.originalParentID = file.$parent.id
 
         // If it's a directory, recursively soft-delete all non-deleted descendants first
-        // so they share the same deletedAt timestamp (used for selective restore).
+        // so they share the same trashGroupID (used for selective restore).
         if file.isDirectory {
-            try await softDeleteDescendants(of: fileID, userID: userID, deletedAt: now)
+            try await softDeleteDescendants(of: fileID, userID: userID, deletedAt: now, trashGroupID: trashGroupID)
         }
 
         // Soft-delete the root item itself via Fluent.
-        // We set deletedAt explicitly so it matches the descendants' timestamp.
         file.deletedAt = now
+        file.trashGroupID = trashGroupID
         try await file.save(on: db)
 
         try await recordSyncChange(
@@ -566,7 +595,8 @@ struct StorageService: Sendable {
 
     private func getBreadcrumbs(for parentID: UUID?, userID: UUID) async throws -> [Breadcrumb] {
         var crumbs: [Breadcrumb] = [
-            Breadcrumb(name: "All Files", id: nil)
+            Breadcrumb(
+                name: "Home", id: nil, labelKey: "navigation.allFiles", icon: "home", path: "/")
         ]
         var currentID = parentID
         var pathCrumbs: [Breadcrumb] = []
@@ -585,7 +615,10 @@ struct StorageService: Sendable {
     /// Walks up the ancestor chain until it finds a non-deleted parent (the trash boundary).
     private func getTrashBreadcrumbs(for folderID: UUID, userID: UUID) async throws -> [Breadcrumb]
     {
-        var crumbs: [Breadcrumb] = [Breadcrumb(name: "Trash", id: nil)]
+        var crumbs: [Breadcrumb] = [
+            Breadcrumb(
+                name: "Trash", id: nil, labelKey: "navigation.trash", icon: "trash", path: "/trash")
+        ]
         var currentID: UUID? = folderID
         var pathCrumbs: [Breadcrumb] = []
 
@@ -598,7 +631,14 @@ struct StorageService: Sendable {
                     .first()
             else { break }
 
-            pathCrumbs.insert(Breadcrumb(name: dir.filename, id: dir.id), at: 0)
+            if let validDirID = dir.id {
+                pathCrumbs.insert(
+                    Breadcrumb(
+                        name: dir.filename, id: validDirID, path: "/trash/\(validDirID.uuidString)"),
+                    at: 0)
+            } else {
+                pathCrumbs.insert(Breadcrumb(name: dir.filename, id: dir.id), at: 0)
+            }
 
             // Stop climbing once we reach an item whose parent is not in trash
             if let parentID = dir.$parent.id {
@@ -623,7 +663,7 @@ struct StorageService: Sendable {
     /// Fetches top-level trash items. An item appears at the trash root if:
     /// - It has no parent, OR
     /// - Its parent is not deleted, OR
-    /// - Its deleted_at differs from its parent's (independently trashed)
+    /// - Its trash_group_id differs from its parent's (independently trashed)
     private func fetchTrashRoots(userID: UUID) async throws -> [FileMetadata] {
         guard let sql = db as? any SQLDatabase else { return [] }
         return try await sql.raw(
@@ -635,7 +675,7 @@ struct StorageService: Sendable {
             AND (
                 f.parent_id IS NULL
                 OR p.deleted_at IS NULL
-                OR f.deleted_at != p.deleted_at
+                OR f.trash_group_id != p.trash_group_id
             )
             ORDER BY f.deleted_at DESC
             """
@@ -646,33 +686,36 @@ struct StorageService: Sendable {
     /// Only touches items that are not already in trash (deletedAt IS NULL),
     /// preserving the original deletedAt of independently trashed items.
     private func softDeleteDescendants(
-        of parentID: UUID, userID: UUID, deletedAt: Date
+        of parentID: UUID, userID: UUID, deletedAt: Date, trashGroupID: UUID
     ) async throws {
         guard let sql = db as? any SQLDatabase else { return }
 
         try await sql.raw(
             """
             WITH RECURSIVE descendants AS (
-                SELECT id FROM file_metadata
+                SELECT id, parent_id FROM file_metadata
                 WHERE parent_id = \(bind: parentID)
                 AND owner_id = \(bind: userID)
                 AND deleted_at IS NULL
                 UNION ALL
-                SELECT f.id FROM file_metadata f
+                SELECT f.id, f.parent_id FROM file_metadata f
                 INNER JOIN descendants d ON f.parent_id = d.id
                 WHERE f.owner_id = \(bind: userID)
                 AND f.deleted_at IS NULL
             )
-            UPDATE file_metadata SET deleted_at = \(bind: deletedAt)
+            UPDATE file_metadata SET
+                deleted_at = \(bind: deletedAt),
+                trash_group_id = \(bind: trashGroupID),
+                original_parent_id = parent_id
             WHERE id IN (SELECT id FROM descendants)
             """
         ).run()
     }
 
     /// Recursively restores descendants that were trashed as part of the same action
-    /// (matching deleted_at timestamp). Independently trashed items remain in trash.
+    /// (matching trash_group_id). Independently trashed items remain in trash.
     private func restoreDescendants(
-        of parentID: UUID, userID: UUID, deletedAt: Date
+        of parentID: UUID, userID: UUID, trashGroupID: UUID
     ) async throws {
         guard let sql = db as? any SQLDatabase else { return }
 
@@ -687,9 +730,12 @@ struct StorageService: Sendable {
                 INNER JOIN descendants d ON f.parent_id = d.id
                 WHERE f.owner_id = \(bind: userID)
             )
-            UPDATE file_metadata SET deleted_at = NULL
+            UPDATE file_metadata SET
+                deleted_at = NULL,
+                trash_group_id = NULL,
+                original_parent_id = NULL
             WHERE id IN (SELECT id FROM descendants)
-            AND deleted_at = \(bind: deletedAt)
+            AND trash_group_id = \(bind: trashGroupID)
             """
         ).run()
     }
