@@ -37,6 +37,12 @@ final class FileMetadata: Model, Content, @unchecked Sendable {
     @Timestamp(key: "deleted_at", on: .delete)
     var deletedAt: Date?
 
+    @OptionalField(key: "trash_group_id")
+    var trashGroupID: UUID?
+
+    @OptionalField(key: "original_parent_id")
+    var originalParentID: UUID?
+
     @Field(key: "is_favorite")
     var isFavorite: Bool
 
