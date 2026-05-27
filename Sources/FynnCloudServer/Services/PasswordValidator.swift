@@ -1,3 +1,4 @@
+import FynnCloudLocalization
 import Vapor
 
 struct PasswordValidator {
