@@ -5,6 +5,14 @@ import JWT
 import Vapor
 
 struct AuthController: RouteCollection {
+/// Allowed official OAuth client IDs for authentication
+    public static let allowedClientIDs: Set<String> = [
+        "fynncloud-web",
+        "fynncloud-desktop",
+        "fynncloud-ios",
+        "fynncloud-android",
+    ]
+
     func boot(routes: any RoutesBuilder) throws {
         let api = routes.grouped("api", "auth")
 
