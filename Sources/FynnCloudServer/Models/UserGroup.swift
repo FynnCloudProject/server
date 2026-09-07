@@ -13,11 +13,15 @@ final class UserGroup: Model, Content, @unchecked Sendable {
     @Parent(key: "group_id")
     var group: Group
 
-    init() {}
+    @Field(key: "source")
+    var source: String
 
-    init(id: Int? = nil, userID: User.IDValue, groupID: Group.IDValue) {
+    init() { self.source = "manual" }
+
+    init(id: Int? = nil, userID: User.IDValue, groupID: Group.IDValue, source: String = "manual") {
         self.id = id
         self.$user.id = userID
         self.$group.id = groupID
+        self.source = source
     }
 }
