@@ -11,7 +11,7 @@ extension Request {
                 .with(\.$groups)
                 .first()
         else {
-            throw Abort(.notFound, reason: "User not found").localized("error.unauthorized")
+            throw Abort(.notFound, reason: "User not found").localized(LocalizationKeys.Error.Http.Unauthorized)
         }
         return user
     }
