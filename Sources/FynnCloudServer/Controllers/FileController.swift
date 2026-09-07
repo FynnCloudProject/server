@@ -6,18 +6,16 @@ struct FileController: RouteCollection {
         let api = routes.grouped("api", "files")
         let protected = api.grouped(UserPayloadAuthenticator(), UserPayload.guardMiddleware())
 
-        // Enumerate
         protected.get(use: index)
-        protected.get(":fileID", use: show)
         protected.get("recent", use: recent)
         protected.get("favorites", use: favorites)
         protected.get("shared", use: shared)
+        protected.get("shared-with-others", use: sharedWithOthers)
         protected.get("trash", use: trash)
         protected.get("all", use: all)
+        protected.get("search", use: search)
+        protected.get(":fileID", use: show)
 
-        // Upload
-        protected.on(.PUT, body: .stream, use: upload)
-        protected.on(.PUT, ":fileID", body: .stream, use: update)
         protected.post("multipart", "initiate", use: initiateMultipartUpload)
         let jwtProtected = api.grouped(
             UploadSessionAuthenticator(), UploadSessionToken.guardMiddleware())
@@ -26,107 +24,258 @@ struct FileController: RouteCollection {
         jwtProtected.post("multipart", ":sessionID", "complete", use: completeMultipartUpload)
         jwtProtected.delete("multipart", ":sessionID", "abort", use: abortMultipartUpload)
 
-        // Directory operations
         protected.post("create-directory", use: createDirectory)
-        protected.post("move-file", use: moveFile)
+        protected.post("create-file", use: createFile)
 
-        // Modify
         protected.patch(":fileID", use: rename)
         protected.post(":fileID", "favorite", use: toggleFavorite)
-        protected.post(":fileID", "restore", use: restore)
 
-        // Download
         protected.get(":fileID", "download", use: download)
+        protected.get(":fileID", "thumbnail", use: thumbnail)
+        protected.get(":fileID", "activity", use: activity)
 
-        // Soft delete & permanent delete
-        protected.delete(":fileID", use: delete)
-        protected.delete(":fileID", "permanent-delete", use: permanentDelete)
+        // Everything that acts on a set of files takes an id array, a single file being `[id]`.
+        protected.post("move", use: moveMany)
+        protected.post("restore", use: restoreMany)
+        protected.post("trash", use: trashMany)
+        protected.post("permanent-delete", use: permanentDeleteMany)
     }
 
-    // MARK: - Handlers
+    /// Bulk endpoints take an id array; duplicates are collapsed so a file is never processed twice.
+    private func uniqueIDs(_ ids: [UUID]) -> [UUID] {
+        var seen = Set<UUID>()
+        return ids.filter { seen.insert($0).inserted }
+    }
+
+    /// Paging and ordering shared by every listing view.
+    private struct ListingQuery {
+        let window: PageRequest
+        let sortBy: String?
+        let sortDirection: DatabaseQuery.Sort.Direction?
+    }
+
+    /// Omitting `limit` deliberately returns the WHOLE listing in one response - the web client's
+    /// "select all" depends on that.
+    private func listingQuery(_ req: Request) -> ListingQuery {
+        ListingQuery(
+            window: PageRequest(
+                page: try? req.query.get(Int.self, at: "page"),
+                limit: try? req.query.get(Int.self, at: "limit")),
+            sortBy: try? req.query.get(String.self, at: "sortBy"),
+            sortDirection: parseSortDirection(try? req.query.get(String.self, at: "sortDirection"))
+        )
+    }
+
+    private func parseSortDirection(_ raw: String?) -> DatabaseQuery.Sort.Direction? {
+        switch raw {
+        case "asc": return .ascending
+        case "desc": return .descending
+        default: return nil
+        }
+    }
 
     func index(req: Request) async throws -> FileIndexDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
         let parentID = try? req.query.get(UUID.self, at: "parentID")
-        return try await req.storage.list(filter: .folder(id: parentID), userID: userID)
+        let q = listingQuery(req)
+        return try await req.fileListing.list(
+            filter: .folder(id: parentID), userID: userID, window: q.window,
+            sortBy: q.sortBy, sortDirection: q.sortDirection)
     }
 
     func all(req: Request) async throws -> FileIndexDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
-        return try await req.storage.list(filter: .all, userID: userID)
+        let q = listingQuery(req)
+        return try await req.fileListing.list(
+            filter: .all, userID: userID, window: q.window,
+            sortBy: q.sortBy, sortDirection: q.sortDirection)
     }
 
-    func show(req: Request) async throws -> FileMetadata {
+    func show(req: Request) async throws -> FileIndexItemDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
         let fileID = try req.parameters.require("fileID", as: UUID.self)
-        return try await req.storage.getMetadata(for: fileID, userID: userID)
+        return try await req.fileListing.itemDTO(fileID: fileID, userID: userID)
+    }
+
+    func activity(req: Request) async throws -> ActivityResponse {
+        let userID = try req.auth.require(UserPayload.self).getID()
+        let fileID = try req.parameters.require("fileID", as: UUID.self)
+        let params = try req.query.decode(ActivityRequest.self)
+
+        return try await SyncController.fetchActivity(
+            db: req.db,
+            fileAccess: req.fileAccess,
+            userID: userID,
+            fileID: fileID,
+            page: params.page ?? 1,
+            limit: params.limit ?? 30
+        )
     }
 
     func favorites(req: Request) async throws -> FileIndexDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
-        return try await req.storage.list(filter: .favorites, userID: userID)
+        let q = listingQuery(req)
+        return try await req.fileListing.list(
+            filter: .favorites, userID: userID, window: q.window,
+            sortBy: q.sortBy, sortDirection: q.sortDirection)
     }
 
     func trash(req: Request) async throws -> FileIndexDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
         let parentID = try? req.query.get(UUID.self, at: "parentID")
-        return try await req.storage.list(filter: .trash(parentID: parentID), userID: userID)
+        let q = listingQuery(req)
+        return try await req.fileListing.list(
+            filter: .trash(parentID: parentID), userID: userID, window: q.window,
+            sortBy: q.sortBy, sortDirection: q.sortDirection)
     }
 
     func recent(req: Request) async throws -> FileIndexDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
-        return try await req.storage.list(filter: .recent, userID: userID)
+        let q = listingQuery(req)
+        return try await req.fileListing.list(
+            filter: .recent, userID: userID, window: q.window,
+            sortBy: q.sortBy, sortDirection: q.sortDirection)
     }
 
     func shared(req: Request) async throws -> FileIndexDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
-        return try await req.storage.list(filter: .shared, userID: userID)
+        let q = listingQuery(req)
+        return try await req.fileListing.list(
+            filter: .shared, userID: userID, window: q.window,
+            sortBy: q.sortBy, sortDirection: q.sortDirection)
     }
 
-    func permanentDelete(req: Request) async throws -> HTTPStatus {
+    func sharedWithOthers(req: Request) async throws -> FileIndexDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
-        let fileID = try req.parameters.require("fileID", as: UUID.self)
-
-        try await req.storage.deleteRecursive(fileID: fileID, userID: userID)
-        req.logger.info(
-            "File permanently deleted",
-            metadata: [
-                "fileID": .string(fileID.uuidString),
-                "userID": .string(userID.uuidString),
-                "action": "permanent_delete",
-            ])
-        return .noContent
+        let q = listingQuery(req)
+        return try await req.fileListing.list(
+            filter: .sharedWithOthers, userID: userID, window: q.window,
+            sortBy: q.sortBy, sortDirection: q.sortDirection)
     }
 
-    func upload(req: Request) async throws -> FileMetadata {
+    /// Results are relevance-ranked, so `sortBy`/`sortDirection` are not accepted here - clients
+    /// present search results as unsortable.
+    func search(req: Request) async throws -> FileIndexDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
+        let query = try req.query.get(String.self, at: "q")
+        let mode = (try? req.query.get(String.self, at: "mode"))
+            .flatMap(FileSearchService.SearchMode.init(rawValue:))
 
-        guard let contentLength = req.headers.first(name: .contentLength).flatMap(Int64.init),
-            contentLength > 0
-        else {
-            throw Abort(.lengthRequired).localized(LocalizationKeys.Common.Error.Generic)
+        let searchService = await req.fileSearchAsync()
+        return try await searchService.search(
+            query: query,
+            userID: userID,
+            window: listingQuery(req).window,
+            mode: mode
+        )
+    }
+
+    // The bulk handlers walk the ids one at a time: a folder and its own children can be in the
+    // same batch, and restore resolves name collisions against the destination folder, so these
+    // must not overlap. They always answer 200 - a batch has one outcome per id, not one status
+    // code.
+
+    /// Runs `action` for every distinct id, collecting per-id outcomes instead of failing the batch.
+    private func runBulk<Result>(
+        req: Request,
+        ids: [UUID],
+        action: String,
+        treatMissingAsSuccess: Bool = false,
+        perform: (UUID) async throws -> Result
+    ) async -> (succeeded: [Result], missing: [UUID], failed: [UUID]) {
+        var succeeded: [Result] = []
+        var missing: [UUID] = []
+        var failed: [UUID] = []
+
+        for id in uniqueIDs(ids) {
+            do {
+                succeeded.append(try await perform(id))
+            } catch {
+                if treatMissingAsSuccess, await isAlreadyGone(req: req, id: id, error: error) {
+                    missing.append(id)
+                } else {
+                    failed.append(id)
+                    logBulkFailure(req: req, id: id, action: action, error: error)
+                }
+            }
         }
 
-        let metadata = try await req.storage.upload(
-            filename: req.query[String.self, at: "filename"] ?? "unnamed",
-            stream: req.body,
-            claimedSize: contentLength,
-            contentType: req.query[String.self, at: "contentType"] ?? "application/octet-stream",
-            parentID: try? req.query.get(UUID.self, at: "parentID"),
-            userID: userID,
-            lastModified: req.query[Int64.self, at: "lastModified"]
-        )
-
-        req.logger.info(
-            "File upload completed", metadata: ["fileID": .string(metadata.id?.uuidString ?? "")])
-        return metadata
+        return (succeeded, missing, failed)
     }
 
-    func createDirectory(req: Request) async throws -> FileMetadata {
+    func trashMany(req: Request) async throws -> BulkFileResultDTO {
+        let userID = try req.auth.require(UserPayload.self).getID()
+        let ids = try req.content.decode(FileIDsInput.self).ids
+
+        let outcome = await runBulk(
+            req: req, ids: ids, action: "move_to_trash", treatMissingAsSuccess: true
+        ) { id in
+            try await req.fileService.moveToTrash(fileID: id, userID: userID)
+            return id
+        }
+
+        return BulkFileResultDTO(
+            succeeded: outcome.succeeded + outcome.missing, failed: outcome.failed)
+    }
+
+    func permanentDeleteMany(req: Request) async throws -> BulkFileResultDTO {
+        let userID = try req.auth.require(UserPayload.self).getID()
+        let ids = try req.content.decode(FileIDsInput.self).ids
+
+        let outcome = await runBulk(
+            req: req, ids: ids, action: "permanent_delete", treatMissingAsSuccess: true
+        ) { id in
+            try await req.fileService.deleteRecursive(fileID: id, userID: userID)
+            return id
+        }
+
+        return BulkFileResultDTO(
+            succeeded: outcome.succeeded + outcome.missing, failed: outcome.failed)
+    }
+
+    /// Deleting is idempotent, so an id that no longer exists counts as done. A file that merely
+    /// isn't visible to this user also raises 404, and that one has to stay a failure.
+    private func isAlreadyGone(req: Request, id: UUID, error: any Error) async -> Bool {
+        guard let abort = error as? any AbortError, abort.status == .notFound else { return false }
+        guard let stillExists = try? await req.fileAccess.exists(fileID: id) else { return false }
+        return !stillExists
+    }
+
+    private func logBulkFailure(req: Request, id: UUID, action: String, error: any Error) {
+        req.logger.warning(
+            "Bulk file operation failed",
+            metadata: [
+                "fileID": .string(id.uuidString),
+                "action": .string(action),
+                "error": .string(String(describing: error)),
+            ])
+    }
+
+    /// Embeddings power semantic search; a failure to enqueue must not fail the write itself.
+    private func dispatchEmbeddingJob(req: Request, fileID: UUID) async {
+        let isEnabled =
+            (try? await req.application.settings.get(AppSettings.EmbeddingEnabled.self)) ?? true
+        guard isEnabled else { return }
+
+        do {
+            try await req.queue.dispatch(
+                ProcessFileEmbeddingJob.self, FileEmbeddingPayload(fileID: fileID))
+        } catch {
+            req.logger(subsystem: .embedding).error(
+                "Failed to dispatch embedding job",
+                metadata: [
+                    "file_id": .stringConvertible(fileID),
+                    "error": .string("\(error)"),
+                ]
+            )
+        }
+    }
+
+    func createDirectory(req: Request) async throws -> FileIndexItemDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
         let data = try req.content.decode(CreateDirData.self)
 
-        let metadata = try await req.storage.createDirectory(
+        let metadata = try await req.fileService.createDirectory(
             name: data.name, parentID: data.parentID, userID: userID)
 
         req.logger.info(
@@ -138,71 +287,58 @@ struct FileController: RouteCollection {
                 "action": "create_directory",
             ])
 
-        return metadata
-    }
-
-    func update(req: Request) async throws -> FileMetadata {
-        let userID = try req.auth.require(UserPayload.self).getID()
-        let fileID = try req.parameters.require("fileID", as: UUID.self)
-
-        guard let size = req.query[Int64.self, at: "size"],
-            let contentType = req.query[String.self, at: "contentType"],
-            let lastModified = req.query[Int64.self, at: "lastModified"]
-        else {
-            throw Abort(.badRequest, reason: "Missing required query parameters").localized(
-                LocalizationKeys.Common.Error.Generic)
+        if let fileID = metadata.id {
+            await dispatchEmbeddingJob(req: req, fileID: fileID)
         }
 
-        let metadata = try await req.storage.update(
-            fileID: fileID,
-            stream: req.body,
-            claimedSize: size,
-            contentType: contentType,
-            userID: userID,
-            lastModified: lastModified
-        )
-        req.logger.info(
-            "File updated",
-            metadata: [
-                "fileID": .string(fileID.uuidString),
-                "userID": .string(userID.uuidString),
-                "lastModified": .string(lastModified.description),
-                "action": "update_file",
-            ])
-
-        return metadata
+        return try await req.fileListing.itemDTOs(for: [metadata], userID: userID)[0]
     }
 
-    func moveFile(req: Request) async throws -> FileMetadata {
+    func createFile(req: Request) async throws -> FileIndexItemDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
+        let data = try req.content.decode(CreateFileData.self)
 
-        let input = try req.content.decode(MoveFileInput.self)
-
-        let metadata = try await req.storage.move(
-            fileID: input.fileID,
-            newParentID: input.parentID,
-            userID: userID
-        )
+        let metadata = try await req.fileService.createFile(
+            name: data.name, type: data.type, parentID: data.parentID, userID: userID)
 
         req.logger.info(
-            "File moved",
+            "File created",
             metadata: [
-                "fileID": .string(input.fileID.uuidString),
+                "fileID": .string(metadata.id?.uuidString ?? ""),
                 "userID": .string(userID.uuidString),
-                "newParentID": .string(input.parentID?.uuidString ?? "root"),
-                "action": "move_file",
+                "name": .string(data.name),
+                "type": .string(data.type.rawValue),
+                "action": "create_file",
             ])
 
-        return metadata
+        if let fileID = metadata.id {
+            await dispatchEmbeddingJob(req: req, fileID: fileID)
+        }
+
+        return try await req.fileListing.itemDTOs(for: [metadata], userID: userID)[0]
     }
 
-    func rename(req: Request) async throws -> FileMetadata {
+    func moveMany(req: Request) async throws -> BulkFileItemsResultDTO {
+        let userID = try req.auth.require(UserPayload.self).getID()
+        let input = try req.content.decode(MoveFilesInput.self)
+
+        let outcome = await runBulk(req: req, ids: input.ids, action: "move_file") { id in
+            try await req.fileService.move(
+                fileID: id, newParentID: input.parentID, userID: userID)
+        }
+
+        return BulkFileItemsResultDTO(
+            succeeded: try await req.fileListing.itemDTOs(for: outcome.succeeded, userID: userID),
+            failed: outcome.failed)
+    }
+
+    func rename(req: Request) async throws -> FileIndexItemDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
         let fileID = try req.parameters.require("fileID", as: UUID.self)
 
         let input = try req.content.decode(RenameInput.self)
 
-        let metadata = try await req.storage.rename(
+        let metadata = try await req.fileService.rename(
             fileID: fileID,
             newName: input.name,
             userID: userID
@@ -217,77 +353,64 @@ struct FileController: RouteCollection {
                 "action": "rename_file",
             ])
 
-        return metadata
+        GenerateThumbnailJob.dispatchIfNeeded(for: metadata, req: req)
+
+        return try await req.fileListing.itemDTOs(for: [metadata], userID: userID)[0]
     }
 
     func download(req: Request) async throws -> Response {
         let userID = try req.auth.require(UserPayload.self).getID()
         let fileID = try req.parameters.require("fileID", as: UUID.self)
-
-        let response = try await req.storage.getFileResponse(for: fileID, userID: userID)
-
-        // Only attach headers if it's not a redirect (e.g., if streaming directly from provider)
-        if ![.seeOther, .temporaryRedirect].contains(response.status) {
-            if let metadata = try await FileMetadata.find(fileID, on: req.db) {
-                response.headers.replaceOrAdd(
-                    name: .contentDisposition,
-                    value: "attachment; filename=\"\(metadata.filename)\"")
-                response.headers.replaceOrAdd(name: .contentType, value: metadata.contentType)
-            }
-        }
-        return response
+        let isInline =
+            req.query[String.self, at: "inline"] == "true"
+            || req.query[String.self, at: "disposition"] == "inline"
+        return try await req.fileService.getDownloadResponse(
+            fileID: fileID,
+            userID: userID,
+            range: req.headers.range,
+            ifNoneMatch: req.headers.first(name: .ifNoneMatch),
+            isInline: isInline
+        )
     }
 
-    func delete(req: Request) async throws -> HTTPStatus {
+    func thumbnail(req: Request) async throws -> Response {
         let userID = try req.auth.require(UserPayload.self).getID()
         let fileID = try req.parameters.require("fileID", as: UUID.self)
 
-        try await req.storage.moveToTrash(fileID: fileID, userID: userID)
-        return .noContent
+        switch try await req.fileService.getThumbnail(fileID: fileID, userID: userID) {
+        case .available(let response):
+            response.apply(.derived, contentType: "image/jpeg")
+            return response
+        case .needsGeneration(let file):
+            GenerateThumbnailJob.dispatchIfNeeded(for: file, req: req)
+            throw Abort(.notFound, reason: "No thumbnail available")
+        }
     }
 
-    func restore(req: Request) async throws -> FileMetadata {
+    func restoreMany(req: Request) async throws -> BulkFileItemsResultDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
+        let ids = try req.content.decode(FileIDsInput.self).ids
 
-        guard let fileID = req.parameters.get("fileID", as: UUID.self)
-        else {
-            throw Abort(.notFound).localized(LocalizationKeys.Files.Error.RestoreFailed)
+        let outcome = await runBulk(req: req, ids: ids, action: "restore_file") { id in
+            try await req.fileService.restore(fileID: id, userID: userID)
         }
 
-        return try await req.storage.restore(fileID: fileID, userID: userID)
+        return BulkFileItemsResultDTO(
+            succeeded: try await req.fileListing.itemDTOs(for: outcome.succeeded, userID: userID),
+            failed: outcome.failed)
     }
 
-    func toggleFavorite(req: Request) async throws -> FileMetadata {
+    func toggleFavorite(req: Request) async throws -> FileIndexItemDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
+        let fileID = try req.parameters.require("fileID", as: UUID.self)
 
-        guard let fileID = req.parameters.get("fileID", as: UUID.self),
-            let file = try await FileMetadata.query(on: req.db)
-                .filter(\.$id == fileID)
-                .filter(\.$owner.$id == userID)
-                .first()
-        else {
-            throw Abort(.notFound).localized(LocalizationKeys.Common.Error.Generic)
-        }
+        // Absent in both body and query means "flip whatever it is now".
+        let desired =
+            (try? req.content.decode(ToggleFavoriteInput.self))?.isFavorite
+            ?? (try? req.query.get(String.self, at: "value")).flatMap(Bool.init)
 
-        if let input = try? req.content.decode(ToggleFavoriteInput.self), let val = input.isFavorite
-        {
-            file.isFavorite = val
-        } else {
-            file.isFavorite.toggle()
-        }
-
-        try await file.save(on: req.db)
-
-        req.logger.info(
-            "File favorite toggled",
-            metadata: [
-                "fileID": .string(fileID.uuidString),
-                "userID": .string(userID.uuidString),
-                "isFavorite": .string("\(file.isFavorite)"),
-                "action": "toggle_favorite",
-            ])
-
-        return file
+        return try await req.fileListing.setFavorite(
+            fileID: fileID, userID: userID, isFavorite: desired)
     }
 
     // MARK: - Multipart Upload Handlers
@@ -296,30 +419,34 @@ struct FileController: RouteCollection {
         let userID = try req.auth.require(UserPayload.self).getID()
         let input = try req.content.decode(InitiateMultipartInput.self)
 
-        let session = try await req.storage.initiateMultipartUpload(
+        let session = try await req.fileUploads.initiateMultipartUpload(
+            fileID: input.fileID,
             filename: input.filename,
             contentType: input.contentType,
             totalSize: input.totalSize,
             parentID: input.parentID,
             lastModified: input.lastModified,
+            createdAt: input.createdAt,
             userID: userID,
-            request: req
+            maxChunkSize: Int64(req.application.config.maxChunkSize.value)
         )
 
-        // Generate JWT token with ALL metadata for stateless uploads
         let token = UploadSessionToken(
-            exp: .init(value: Date().addingTimeInterval(86400)),  // 24 hours
+            exp: .init(value: Date().addingTimeInterval(UploadRules.sessionTTL)),
             iat: .init(value: Date()),
             sessionID: session.sessionID,
             fileID: session.fileID,
             uploadID: session.uploadID,
-            userID: userID,
+            userID: session.userID,
             filename: session.filename,
             contentType: session.contentType,
             totalSize: session.totalSize,
             maxChunkSize: session.maxChunkSize,
             parentID: session.parentID,
-            lastModified: session.lastModified
+            lastModified: session.lastModified,
+            createdAt: session.createdAt,
+            isUpdate: session.isUpdate,
+            reservationID: session.reservationID
         )
 
         let jwtToken = try await req.jwt.sign(token)
@@ -342,10 +469,8 @@ struct FileController: RouteCollection {
     }
 
     func uploadPart(req: Request) async throws -> UploadPartResponse {
-        // Authenticate using JWT from Authorization header
         let token = try req.auth.require(UploadSessionToken.self)
 
-        // Validate route parameters match JWT claims
         let sessionID = try req.parameters.require("sessionID", as: UUID.self)
         let partNumber = try req.parameters.require("partNumber", as: Int.self)
 
@@ -359,13 +484,11 @@ struct FileController: RouteCollection {
             throw Abort(.lengthRequired, reason: "Content-Length header required")
         }
 
-        // Validate part size doesn't exceed max chunk size
         guard contentLength <= token.maxChunkSize else {
             throw Abort(.badRequest, reason: "Chunk size exceeds maximum allowed")
         }
 
-        // STATELESS - streams to provider, NO DB operations
-        let completedPart = try await req.storage.uploadPartWithToken(
+        let completedPart = try await req.fileUploads.uploadPart(
             fileID: token.fileID,
             uploadID: token.uploadID,
             partNumber: partNumber,
@@ -390,17 +513,7 @@ struct FileController: RouteCollection {
         )
     }
 
-    struct CompleteMultipartInput: Content {
-        let parts: [CompletedPartDTO]
-    }
-
-    struct CompletedPartDTO: Content {
-        let partNumber: Int
-        let etag: String
-        let size: Int64
-    }
-
-    func completeMultipartUpload(req: Request) async throws -> FileMetadata {
+    func completeMultipartUpload(req: Request) async throws -> FileIndexItemDTO {
         let token = try req.auth.require(UploadSessionToken.self)
         let sessionID = try req.parameters.require("sessionID", as: UUID.self)
 
@@ -408,15 +521,13 @@ struct FileController: RouteCollection {
             throw Abort(.forbidden, reason: "Session ID mismatch")
         }
 
-        // Parse parts from request body (client tracked these during upload)
         let input = try req.content.decode(CompleteMultipartInput.self)
 
         let parts = input.parts.map { dto in
             CompletedPart(partNumber: dto.partNumber, etag: dto.etag, size: dto.size)
         }
 
-        // Complete using JWT metadata - stateless!
-        let metadata = try await req.storage.completeMultipartUploadWithToken(
+        let metadata = try await req.fileUploads.completeMultipartUpload(
             sessionID: token.sessionID,
             fileID: token.fileID,
             uploadID: token.uploadID,
@@ -426,6 +537,9 @@ struct FileController: RouteCollection {
             totalSize: token.totalSize,
             parentID: token.parentID,
             lastModified: token.lastModified,
+            createdAt: token.createdAt,
+            isUpdate: token.isUpdate ?? false,
+            reservationID: token.reservationID,
             parts: parts
         )
 
@@ -437,19 +551,25 @@ struct FileController: RouteCollection {
             ]
         )
 
-        return metadata
+        if let fileID = metadata.id {
+            await dispatchEmbeddingJob(req: req, fileID: fileID)
+            GenerateThumbnailJob.dispatchIfNeeded(
+                fileID: fileID, contentType: token.contentType, req: req)
+        }
+
+        return try await req.fileListing.itemDTOs(for: [metadata], userID: token.userID)[0]
     }
 
     func abortMultipartUpload(req: Request) async throws -> HTTPStatus {
-        // Use JWT authentication to get all metadata
         let token = try req.auth.require(UploadSessionToken.self)
 
-        try await req.storage.abortMultipartUpload(
+        try await req.fileUploads.abortMultipartUpload(
             fileID: token.fileID,
             uploadID: token.uploadID,
             sessionID: token.sessionID,
             totalSize: token.totalSize,
-            userID: token.userID
+            userID: token.userID,
+            reservationID: token.reservationID
         )
 
         req.logger.info(
