@@ -13,6 +13,20 @@ public func configure(_ app: Application) async throws {
     configureCORS(app, config: config)
     configureErrorMiddleware(app)
 
+    // Configure global JSON decoder/encoder date strategies for ISO8601 dates with/without fractional seconds
+    let jsonDecoder = JSONDecoder()
+    jsonDecoder.dateDecodingStrategy = .customISO8601
+    ContentConfiguration.global.use(decoder: jsonDecoder, for: .json)
+
+    let jsonEncoder = JSONEncoder()
+    jsonEncoder.dateEncodingStrategy = .customISO8601
+    ContentConfiguration.global.use(encoder: jsonEncoder, for: .json)
+
+    // Increase HTTP client pool for embedding service requests
+    app.http.client.configuration.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 16
+    app.http.client.configuration.timeout.connect = .seconds(10)
+    app.http.client.configuration.timeout.read = .seconds(120)
+
     switch config.database {
     case .postgres(let pgConfig):
         app.databases.use(.postgres(configuration: pgConfig), as: .psql)
