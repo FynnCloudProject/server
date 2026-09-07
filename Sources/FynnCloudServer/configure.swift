@@ -22,7 +22,14 @@ public func configure(_ app: Application) async throws {
 
     switch config.storage {
     case .s3(let bucket):
-        app.logger.info("Using S3 storage with bucket: \(bucket)")
+        app.logger.info("Using S3 storage with bucket: \(bucket)]
+        )
+        var httpClientConfig = HTTPClient.Configuration()
+        httpClientConfig.httpVersion = .http1Only
+        let httpClient = HTTPClient(
+            eventLoopGroupProvider: .shared(app.eventLoopGroup),
+            configuration: httpClientConfig
+        )
         let awsClient = AWSClient(
             credentialProvider: .static(
                 accessKeyId: config.aws.accessKey,
