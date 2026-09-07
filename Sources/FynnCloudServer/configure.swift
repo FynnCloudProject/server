@@ -164,6 +164,20 @@ app.migrations.add(RewriteSyncInfrastructure())
         try await app.autoMigrate()
     }
 
+    let poolOptions = RedisConfiguration.PoolOptions(
+        maximumConnectionCount: .maximumActiveConnections(20),
+        minimumConnectionCount: 2,
+        connectionRetryTimeout: .seconds(2)
+    )
+    let redisConfig = try RedisConfiguration(url: config.redisURL, pool: poolOptions)
+
+    app.redis.configuration = redisConfig
+    app.redis(.pubsub).configuration = redisConfig
+
+    // Redis is a hard dependency: quota admission, OIDC flow state and OAuth code exchange are
+    // only correct with it, so refuse to boot rather than degrade invisibly.
+    app.lifecycle.use(RedisPingLifecycleHandler(redisURL: config.redisURL))
+
     app.settings = SettingsService(database: app.db, redis: app.redis, logger: app.logger)
 
     // Resolve SSO providers from settings (ENV > DB) now that settings are available.
