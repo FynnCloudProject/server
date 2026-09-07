@@ -1,0 +1,6 @@
+module CLDAPShim [system] {
+  header "/usr/include/ldap.h"
+  link "ldap"
+  link "lber"
+  export *
+}
