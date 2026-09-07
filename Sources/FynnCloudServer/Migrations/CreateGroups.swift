@@ -1,4 +1,5 @@
 import Fluent
+import SQLKit
 
 struct CreateGroups: AsyncMigration {
     func prepare(on database: any Database) async throws {
@@ -18,8 +19,9 @@ struct CreateGroups: AsyncMigration {
             .unique(on: "user_id", "group_id")
             .create()
 
-        let adminGroup = Group(name: "admin", isAdmin: true)
-        try await adminGroup.create(on: database)
+        if let sql = database as? any SQLDatabase {
+            try await sql.raw("INSERT INTO groups (name, is_admin) VALUES ('admin', \(bind: true))").run()
+        }
     }
 
     func revert(on database: any Database) async throws {

@@ -20,12 +20,8 @@ struct AddIsAdminToGroups: AsyncMigration {
         }
 
         // Set existing "admin" group to be admin
-        if let adminGroup = try await Group.query(on: database)
-            .filter(\.$name == "admin")
-            .first()
-        {
-            adminGroup.isAdmin = true
-            try await adminGroup.save(on: database)
+        if let sql = database as? any SQLDatabase {
+            try await sql.raw("UPDATE groups SET is_admin = true WHERE name = 'admin'").run()
         }
     }
 

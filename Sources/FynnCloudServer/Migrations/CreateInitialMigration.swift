@@ -2,7 +2,6 @@ import Fluent
 
 struct CreateInitialMigration: AsyncMigration {
     func prepare(on database: any Database) async throws {
-        // Create Storage Tiers
         try await database.schema("storage_tiers")
             .field(.id, .int, .identifier(auto: true))
             .field("name", .string, .required)
@@ -10,7 +9,6 @@ struct CreateInitialMigration: AsyncMigration {
             .unique(on: "name")
             .create()
 
-        // Create Users
         try await database.schema("users")
             .id()
             .field("username", .string, .required)
@@ -22,7 +20,6 @@ struct CreateInitialMigration: AsyncMigration {
             .unique(on: "email")
             .create()
 
-        // Create File Metadata
         try await database.schema("file_metadata")
             .id()
             .field("filename", .string, .required)
@@ -39,13 +36,10 @@ struct CreateInitialMigration: AsyncMigration {
             .field("is_shared", .bool, .required, .sql(.default(false)))
             .create()
 
-        // Seed Default Storage Tiers
-        let standardTier = StorageTier(name: "Standard", limitBytes: 5 * 1024 * 1024 * 1024)  // 5GB
-        let extraTier = StorageTier(name: "Extra", limitBytes: 50 * 1024 * 1024 * 1024)  // 50GB
+        let standardTier = StorageTier(name: "5 GB", limitBytes: 5 * 1024 * 1024 * 1024)  // 5GB
         let unlimitedTier = StorageTier(name: "Unlimited", limitBytes: 1_125_899_906_842_624)  // 1 PB = unlimited
 
         try await standardTier.create(on: database)
-        try await extraTier.create(on: database)
         try await unlimitedTier.create(on: database)
 
     }

@@ -16,19 +16,15 @@ struct CreateMultipartUploadSessions: AsyncMigration {
             .unique(on: "upload_id")
             .create()
 
-        // Create indexes for performance
         if let sql = database as? any SQLDatabase {
-            // Index on user_id for user cleanup queries
             try await sql.raw(
                 "CREATE INDEX idx_multipart_sessions_user_id ON multipart_upload_sessions(user_id)"
             ).run()
 
-            // Index on expires_at for cleanup job
             try await sql.raw(
                 "CREATE INDEX idx_multipart_sessions_expires_at ON multipart_upload_sessions(expires_at)"
             ).run()
 
-            // Index on file_id for duplicate completion check
             try await sql.raw(
                 "CREATE INDEX idx_multipart_sessions_file_id ON multipart_upload_sessions(file_id)"
             ).run()
