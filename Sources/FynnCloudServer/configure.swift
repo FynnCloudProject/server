@@ -167,6 +167,60 @@ app.migrations.add(RewriteSyncInfrastructure())
     app.settings = SettingsService(database: app.db)
 
     try routes(app)
+
+    // MARK: - Server Runtime Startup
+    // Skip background services and network connections when running CLI commands (e.g. migrate)
+    guard !app.isCLICommand else { return }
+
+    do {
+        let subscription = try await app.subscription.get()
+        app.logger(subsystem: .system).info(
+            "Server booted with valid subscription key",
+            metadata: [
+                "tier": .string(subscription.tier.capitalized),
+                "subscription_id": .string(subscription.subscriptionID),
+            ]
+        )
+    } catch {
+        app.logger(subsystem: .system).warning(
+            "No valid subscription key active on startup",
+            metadata: ["error": .string(error.localizedDescription)]
+        )
+    }
+
+    app.lifecycle.use(PubSubLifecycleHandler())
+
+    try app.queues.startInProcessJobs(on: .default)
+    app.queues.schedule(UploadCleanupJob())
+        .hourly()
+        .at(0)
+    app.queues.schedule(QuotaRecalculationJob())
+        .hourly()
+        .at(30)
+    app.queues.schedule(SessionLastAccessFlushJob())
+        .minutely()
+    app.queues.schedule(ExpiredTokenCleanupJob())
+        .daily()
+        .at(1, 0)
+    app.queues.schedule(TrashCleanupJob())
+        .daily()
+        .at(2, 0)
+    app.queues.schedule(LDAPDirectorySyncJob())
+        .every(minutes: 15)
+    app.queues.schedule(SyncLogPruneJob())
+        .daily()
+        .at(3, 0)
+    try app.queues.startScheduledJobs()
+}
+
+extension Application {
+    /// Returns `true` if a CLI subcommand (like `migrate` or `reindex-files`) is being executed.
+    var isCLICommand: Bool {
+        guard let command = environment.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) else {
+            return false
+        }
+        return command != "serve"
+    }
 }
 
 // MARK: - Middleware
