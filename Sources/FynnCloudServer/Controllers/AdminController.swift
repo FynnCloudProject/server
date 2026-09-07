@@ -169,7 +169,7 @@ struct AdminController: RouteCollection {
                     key: LocalizationKeys.Admin.Alerts.JwtSecretDefault,
                     severity: .critical,
                     message:
-                        "No JWT secret is set, so a new random one is used on every restart — this signs out all users whenever the server restarts. Set a fixed JWT_SECRET."
+                        "No JWT secret is set, so a new random one is used on every restart - this signs out all users whenever the server restarts. Set a fixed JWT_SECRET."
                 ))
         }
 
