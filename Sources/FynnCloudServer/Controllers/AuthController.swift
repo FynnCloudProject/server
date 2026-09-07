@@ -319,6 +319,17 @@ protected.delete("sessions", use: revokeOtherSessions)
             isHTTPOnly: true,
             sameSite: .lax
         )
+
+        response.cookies["fc_session"] = HTTPCookies.Value(
+            string: "",
+            expires: Date(timeIntervalSince1970: 0),
+            maxAge: 0,
+            domain: nil,
+            path: "/",
+            isSecure: isProduction,
+            isHTTPOnly: false,
+            sameSite: .lax
+        )
     }
 
     // MARK: - Session Management
