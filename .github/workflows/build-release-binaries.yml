@@ -21,11 +21,11 @@ jobs:
             os-label: linux
             arch: arm64
           # macOS Apple Silicon (M1/M2/M3)
-          - os: macos-latest
+          - os: macos-26
             os-label: macos
             arch: arm64
           # macOS Intel
-          - os: macos-15-intel
+          - os: macos-26-intel
             os-label: macos
             arch: x86_64
       fail-fast: false
