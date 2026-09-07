@@ -164,7 +164,17 @@ app.migrations.add(RewriteSyncInfrastructure())
         try await app.autoMigrate()
     }
 
-    app.settings = SettingsService(database: app.db)
+    app.settings = SettingsService(database: app.db, redis: app.redis, logger: app.logger)
+
+    // Resolve SSO providers from settings (ENV > DB) now that settings are available.
+    await reloadSSOProviders(app)
+
+    app.queues.use(.redis(redisConfig))
+    app.queues.add(ProcessFileEmbeddingJob())
+    app.queues.add(GenerateThumbnailJob())
+
+    app.commands.use(ReindexFilesCommand(), as: "reindex-files")
+    app.commands.use(GenerateThumbnailsCommand(), as: "generate-thumbnails")
 
     try routes(app)
 
