@@ -7,7 +7,7 @@ import SotoS3
 import Vapor
 
 public func configure(_ app: Application) async throws {
-    let config = AppConfig.load(for: app)
+    let config = try ServerConfig.load(for: app)
     app.config = config
     app.routes.defaultMaxBodySize = config.maxBodySize
 configureRequestLogging(app)
