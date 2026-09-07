@@ -245,15 +245,13 @@ private func configureRequestLogging(_ app: Application) {
 
 private func configureCORS(_ app: Application, config: ServerConfig) {
     let corsConfiguration = CORSMiddleware.Configuration(
-        allowedOrigin: app.environment == .production
-            ? .any(config.corsAllowedOrigins)
-            : .all,
+        allowedOrigin: .any(config.corsAllowedOrigins),
         allowedMethods: [.GET, .POST, .PUT, .OPTIONS, .DELETE, .PATCH],
         allowedHeaders: [
             .accept, .authorization, .contentType, .origin, .xRequestedWith, .userAgent,
             .accessControlAllowOrigin,
         ],
-        allowCredentials: false
+        allowCredentials: true
     )
     app.middleware.use(CORSMiddleware(configuration: corsConfiguration), at: .beginning)
 }
