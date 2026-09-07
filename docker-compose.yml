@@ -15,6 +15,7 @@
 
 x-shared_environment: &shared_environment
   LOG_LEVEL: ${LOG_LEVEL:-debug}
+  LOG_FORMAT: ${LOG_FORMAT:-}
 
 services:
   app:
