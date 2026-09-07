@@ -7,7 +7,7 @@ struct AdminMiddleware: AsyncMiddleware {
         let user = try await request.getFullUser()
         guard user.isAdmin else {
             throw Abort(.forbidden, reason: "Administrator access required").localized(
-                "error.forbidden")
+                LocalizationKeys.Error.Http.Forbidden)
         }
         return try await next.respond(to: request)
     }
