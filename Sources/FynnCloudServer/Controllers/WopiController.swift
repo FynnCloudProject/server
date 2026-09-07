@@ -1,7 +1,7 @@
 import Fluent
 import Vapor
 
-/// Implements the WOPI host protocol consumed by the EuroOffice Document Server, plus an authenticated
+/// Implements the WOPI host protocol consumed by a WOPI compatible docserver, plus an authenticated
 /// bootstrap endpoint the UI uses to open the editor.
 ///
 /// Security model:
