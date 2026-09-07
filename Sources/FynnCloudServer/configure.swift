@@ -101,6 +101,7 @@ private func configureCORS(_ app: Application, config: AppConfig) {
     )
     app.middleware.use(CORSMiddleware(configuration: corsConfiguration), at: .beginning)
 }
+
 private func configureErrorMiddleware(_ app: Application) {
     let environment = app.environment
 
@@ -111,6 +112,7 @@ private func configureErrorMiddleware(_ app: Application) {
             let source: ErrorSource
             var headers: HTTPHeaders
             let localizationKey: String?
+let params: [String: String]?
 
             switch error {
             case let localizedError as LocalizedAbort:
@@ -118,30 +120,35 @@ private func configureErrorMiddleware(_ app: Application) {
                     localizedError.reason, localizedError.status, localizedError.headers, .capture()
                 )
                 localizationKey = localizedError.localizationKey
+params = localizedError.params
 
             case let debugAbort as (any DebuggableError & AbortError):
                 (reason, status, headers, source) = (
                     debugAbort.reason, debugAbort.status, debugAbort.headers,
                     debugAbort.source ?? .capture()
                 )
-                localizationKey = "error.generic"
+                localizationKey = nil
+                params = nil
 
             case let abort as any AbortError:
                 (reason, status, headers, source) = (
                     abort.reason, abort.status, abort.headers, .capture()
                 )
-                localizationKey = "error.generic"
+                localizationKey = nil
+                params = nil
 
             case let debugErr as any DebuggableError:
                 (reason, status, headers, source) = (
                     debugErr.reason, .internalServerError, [:], debugErr.source ?? .capture()
                 )
-                localizationKey = "error.generic"
+                localizationKey = nil
+                params = nil
 
             default:
                 reason = environment.isRelease ? "Something went wrong." : String(describing: error)
                 (status, headers, source) = (.internalServerError, [:], .capture())
-                localizationKey = "error.generic"
+                localizationKey = nil
+                params = nil
             }
 
             req.logger.report(
@@ -157,8 +164,13 @@ private func configureErrorMiddleware(_ app: Application) {
 
             let body: Response.Body
             do {
-                var errorBody: [String: String] = ["error": "true", "reason": reason]
-                if let key = localizationKey { errorBody["localizationKey"] = key }
+                struct ErrorBody: Encodable {
+                    var error: Bool = true
+                    var reason: String
+                    var localizationKey: String?
+                    var params: [String: String]?
+                }
+                let errorBody = ErrorBody(reason: reason, localizationKey: localizationKey, params: params)
 
                 let encoder = try ContentConfiguration.global.requireEncoder(for: .json)
                 var byteBuffer = req.byteBufferAllocator.buffer(capacity: 0)
