@@ -35,6 +35,7 @@ let publicAuth = api.grouped(RateLimitMiddleware(category: .auth))
         // List and Revoke sessions
         protected.get("sessions", use: listSessions)
         protected.delete("sessions", ":grantID", use: revokeSession)
+protected.delete("sessions", use: revokeOtherSessions)
     }
 
     func login(req: Request) async throws -> AuthorizeResponse {
@@ -352,6 +353,49 @@ let publicAuth = api.grouped(RateLimitMiddleware(category: .auth))
             .filter(\.$id == targetGrantID)
             .filter(\.$user.$id == userID)
             .delete()
+
+await GrantValidityCache.invalidate(grantID: targetGrantID, on: req.redis)
+        await SessionActivityService.remove(grantID: targetGrantID, on: req.redis)
+
+        req.logger(subsystem: .auth).info(
+            "Session revoked",
+            metadata: [
+                "user_id": .stringConvertible(userID),
+                "target_grant_id": .stringConvertible(targetGrantID),
+            ]
+        )
+
+        return .noContent
+    }
+
+    func revokeOtherSessions(req: Request) async throws -> HTTPStatus {
+        let payload = try req.auth.require(UserPayload.self)
+        guard let userID = UUID(uuidString: payload.subject.value) else {
+            throw Abort(.unauthorized).localized(LocalizationKeys.Error.Http.Unauthorized)
+        }
+
+        let revokedGrantIDs = try await OAuthGrant.query(on: req.db)
+            .filter(\.$user.$id == userID)
+            .filter(\.$id != payload.grantID)
+            .all(\.$id)
+
+        guard !revokedGrantIDs.isEmpty else { return .noContent }
+
+        try await OAuthGrant.query(on: req.db)
+            .filter(\.$user.$id == userID)
+            .filter(\.$id != payload.grantID)
+            .delete()
+
+        await GrantValidityCache.invalidate(grantIDs: revokedGrantIDs, on: req.redis)
+        await SessionActivityService.remove(grantIDs: revokedGrantIDs, on: req.redis)
+
+        req.logger(subsystem: .auth).info(
+            "Other sessions revoked",
+            metadata: [
+                "user_id": .stringConvertible(userID),
+                "current_grant_id": .stringConvertible(payload.grantID),
+            ]
+        )
 
         return .noContent
     }
