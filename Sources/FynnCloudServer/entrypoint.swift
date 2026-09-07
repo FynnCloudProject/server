@@ -34,4 +34,27 @@ enum Entrypoint {
         }
         try await app.asyncShutdown()
     }
+
+    /// Configures SwiftLog's global logging backend from `LOG_FORMAT` / `LOG_LEVEL` in `env`.
+    ///
+    /// Goes through Vapor's own detector so it also consumes a `--log`/`-l` CLI flag from
+    /// env.commandInput — otherwise it's left as an unconsumed argument and the `serve`
+    /// command later throws `.unknownInput`, regardless of which branch below is taken.
+    private static func bootstrapLogging(env: inout Environment) throws {
+        let logLevel = try Logger.Level.detect(from: &env)
+        let isJsonFormat = Environment.get("LOG_FORMAT")?.lowercased() == "json"
+
+        if isJsonFormat || Environment.get("LOG_LEVEL") != nil {
+            LoggingSystem.bootstrap { label in
+                var handler: any LogHandler =
+                    isJsonFormat
+                    ? JSONLogHandler(label: label)
+                    : StreamLogHandler.standardOutput(label: label)
+                handler.logLevel = logLevel
+                return handler
+            }
+        } else {
+            try LoggingSystem.bootstrap(from: &env)
+        }
+    }
 }
