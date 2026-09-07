@@ -1,7 +1,6 @@
 import JWT
 import Vapor
 
-// MARK: - User JWT Payload
 
 struct UserPayload: JWTPayload, Authenticatable {
     enum CodingKeys: String, CodingKey {
@@ -19,7 +18,7 @@ struct UserPayload: JWTPayload, Authenticatable {
     func getID() throws -> UUID {
         guard let uuid = UUID(uuidString: subject.value) else {
             throw Abort(.badRequest, reason: "Invalid subject claim").localized(
-                "error.unauthorized")
+                LocalizationKeys.Error.Http.Unauthorized)
         }
         return uuid
     }
