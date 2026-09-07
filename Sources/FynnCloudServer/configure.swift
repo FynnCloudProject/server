@@ -171,7 +171,15 @@ app.migrations.add(RewriteSyncInfrastructure())
 
 // MARK: - Middleware
 
-private func configureCORS(_ app: Application, config: AppConfig) {
+private func configureRequestLogging(_ app: Application) {
+    // First access to app.middleware lazily adds Vapor's own RouteLoggingMiddleware (logs only
+    // the incoming request line) + a default ErrorMiddleware; reset before that happens so
+    // neither default gets registered, then add ours.
+    app.middleware = .init()
+    app.middleware.use(RequestLoggingMiddleware())
+}
+
+private func configureCORS(_ app: Application, config: ServerConfig) {
     let corsConfiguration = CORSMiddleware.Configuration(
         allowedOrigin: app.environment == .production
             ? .any(config.corsAllowedOrigins)
