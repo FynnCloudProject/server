@@ -1,16 +1,21 @@
+import AsyncHTTPClient
 import Fluent
 import FluentPostgresDriver
 import FluentSQLiteDriver
 import JWT
+import Queues
+import QueuesRedisDriver
+import Redis
 import SotoCore
 import SotoS3
 import Vapor
 
 public func configure(_ app: Application) async throws {
+
     let config = try ServerConfig.load(for: app)
     app.config = config
     app.routes.defaultMaxBodySize = config.maxBodySize
-configureRequestLogging(app)
+    configureRequestLogging(app)
     configureCORS(app, config: config)
     configureErrorMiddleware(app)
 
@@ -37,7 +42,9 @@ configureRequestLogging(app)
 
     switch config.storage {
     case .s3(let bucket):
-        app.logger.info("Using S3 storage with bucket: \(bucket)]
+        app.logger(subsystem: .storage).info(
+            "Using S3 storage provider",
+            metadata: ["bucket": .string(bucket)]
         )
         var httpClientConfig = HTTPClient.Configuration()
         httpClientConfig.httpVersion = .http1Only
@@ -52,7 +59,8 @@ configureRequestLogging(app)
             ),
             retryPolicy: .default,
             options: .init(),
-            logger: app.logger
+            httpClient: httpClient,
+            logger: app.logger.scoped(to: .storage)
         )
         app.services.awsClient.use { _ in awsClient }
         app.lifecycle.use(AWSLifecycleHandler())
@@ -62,28 +70,16 @@ configureRequestLogging(app)
                 endpoint: config.aws.endpoint), bucket: bucket)
 
     case .local(let path):
-        app.logger.info("Using local storage with path: \(path)")
+        app.logger(subsystem: .storage).info(
+            "Using local file storage provider",
+            metadata: ["path": .string(path)]
+        )
         app.fileStorage = LocalFileSystemProvider(storageDirectory: path)
-    }
-
-    if config.ldapEnabled {
-        let ldapService = LDAPService(configuration: config.ldapConfig)
-        app.services.ldap.use { _ in ldapService }
-        app.lifecycle.use(LDAPLifecycleHandler())
-        app.logger.info("Connecting to LDAP...")
-        do {
-            try await ldapService.connect()
-            app.logger.info("✅ LDAP Connected Successfully")
-        } catch {
-            app.logger.error("❌ Failed to connect to LDAP: \(error)")
-        }
-    } else {
-        app.logger.info("LDAP is disabled")
     }
 
     await app.jwt.keys.add(hmac: HMACKey(from: config.jwtSecret), digestAlgorithm: .sha256)
 
-let subscriptionKeys = JWTKeyCollection()
+    let subscriptionKeys = JWTKeyCollection()
     // Load ES256 subscription public key from bundled resources
     let pubKeyFilename = FileManager.default.fileExists(atPath: app.directory.resourcesDirectory + "subscription_pub.pem") 
         ? "subscription_pub.pem" 
@@ -112,13 +108,13 @@ let subscriptionKeys = JWTKeyCollection()
         envSubscriptionKey: config.subscriptionKey, keys: subscriptionKeys, database: app.db)
 
     app.migrations.add(CreateInitialMigration())
-app.migrations.add(AddDisplayNameToUsers())
+    app.migrations.add(AddDisplayNameToUsers())
     app.migrations.add(CreateSyncLog())
     app.migrations.add(CreateOAuthCode())
     app.migrations.add(AddClientIdAndStateToOAuthCode())
     app.migrations.add(CreateOAuthGrant())
     app.migrations.add(UpdateGrantForRotation())
-app.migrations.add(AddGracePeriodToOAuthGrant())
+    app.migrations.add(AddGracePeriodToOAuthGrant())
     app.migrations.add(AddLastUsedAtToOAuthGrant())
     app.migrations.add(AddIPAddressToOAuthGrant())
     app.migrations.add(CreateMultipartUploadSessions())
@@ -126,11 +122,11 @@ app.migrations.add(AddGracePeriodToOAuthGrant())
     app.migrations.add(CreateAppSettings())
     app.migrations.add(UpdateUnlimitedTier())
     app.migrations.add(AddIsAdminToGroups())
-app.migrations.add(AddAvatarUpdatedAtToUsers())
+    app.migrations.add(AddAvatarUpdatedAtToUsers())
     app.migrations.add(LowercaseUsernames())
     app.migrations.add(AddIndicesToFileMetadata())
     app.migrations.add(AddTrashGroupToFileMetadata())
-app.migrations.add(RewriteSyncInfrastructure())
+    app.migrations.add(RewriteSyncInfrastructure())
     app.migrations.add(CreateShareLinks())
     app.migrations.add(CreateFilenameSearchIndex())
     app.migrations.add(AddContentHashToFileMetadata())
@@ -280,7 +276,7 @@ private func configureErrorMiddleware(_ app: Application) {
             let source: ErrorSource
             var headers: HTTPHeaders
             let localizationKey: String?
-let params: [String: String]?
+            let params: [String: String]?
 
             switch error {
             case let localizedError as LocalizedAbort:
@@ -288,7 +284,7 @@ let params: [String: String]?
                     localizedError.reason, localizedError.status, localizedError.headers, .capture()
                 )
                 localizationKey = localizedError.localizationKey
-params = localizedError.params
+                params = localizedError.params
 
             case let debugAbort as (any DebuggableError & AbortError):
                 (reason, status, headers, source) = (
