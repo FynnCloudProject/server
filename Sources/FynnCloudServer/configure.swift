@@ -61,6 +61,34 @@ public func configure(_ app: Application) async throws {
 
     await app.jwt.keys.add(hmac: HMACKey(from: config.jwtSecret), digestAlgorithm: .sha256)
 
+let subscriptionKeys = JWTKeyCollection()
+    // Load ES256 subscription public key from bundled resources
+    let pubKeyFilename = FileManager.default.fileExists(atPath: app.directory.resourcesDirectory + "subscription_pub.pem") 
+        ? "subscription_pub.pem" 
+        : "license_pub.pem"
+    let subscriptionPubKeyPath = app.directory.resourcesDirectory + pubKeyFilename
+    do {
+        let pemString = try String(contentsOfFile: subscriptionPubKeyPath)
+        let ecdsaKey = try ES256PublicKey(pem: pemString)
+        await subscriptionKeys.add(ecdsa: ecdsaKey)
+        app.logger(subsystem: .system).debug(
+            "Loaded ES256 subscription public key",
+            metadata: ["path": .string(subscriptionPubKeyPath)]
+        )
+    } catch {
+        app.logger(subsystem: .system).error(
+            "Failed to load ES256 subscription public key",
+            metadata: [
+                "path": .string(subscriptionPubKeyPath),
+                "error": .string("\(error)"),
+            ]
+        )
+        throw error
+    }
+
+    app.subscription = SubscriptionService(
+        envSubscriptionKey: config.subscriptionKey, keys: subscriptionKeys, database: app.db)
+
     app.migrations.add(CreateInitialMigration())
 app.migrations.add(AddDisplayNameToUsers())
     app.migrations.add(CreateSyncLog())
