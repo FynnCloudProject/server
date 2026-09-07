@@ -2,9 +2,9 @@ import Fluent
 import Vapor
 
 enum ShareLinkType: String, Codable {
-    case viewOnly = "view_only"  // Standard share (GET)
-    case fileDrop = "file_drop"  // Upload only (POST)
-    case collaborative = "collaborative"  // View and Upload (GET & POST)
+    case viewOnly = "view_only"
+    case fileDrop = "file_drop"
+    case collaborative = "collaborative"
 
     var allowsUpload: Bool {
         switch self {
