@@ -22,15 +22,30 @@ final class OAuthGrant: Model, Content, @unchecked Sendable {
     @Field(key: "current_refresh_token_id")
     var currentRefreshTokenID: UUID?
 
+    @Field(key: "previous_refresh_token_id")
+    var previousRefreshTokenID: UUID?
+
+    @Field(key: "last_rotated_at")
+    var lastRotatedAt: Date?
+
+    @Field(key: "last_used_at")
+    var lastUsedAt: Date?
+
+    @Field(key: "ip_address")
+    var ipAddress: String?
+
     init() {}
 
     init(
-        id: UUID? = nil, userID: UUID, clientID: String, userAgent: String,
+        id: UUID? = nil, userID: UUID, clientID: String, userAgent: String, ipAddress: String? = nil,
     ) {
         self.id = id
         self.$user.id = userID
         self.clientID = clientID
         self.userAgent = userAgent
+        self.ipAddress = ipAddress
         self.currentRefreshTokenID = nil
+        self.previousRefreshTokenID = nil
+        self.lastRotatedAt = nil
     }
 }
