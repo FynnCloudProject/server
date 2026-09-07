@@ -15,14 +15,17 @@ struct AuthController: RouteCollection {
 
     func boot(routes: any RoutesBuilder) throws {
         let api = routes.grouped("api", "auth")
+let publicAuth = api.grouped(RateLimitMiddleware(category: .auth))
 
-        // PUBLIC
-        api.post("login", use: login)
-        api.post("register", use: register)
-        api.post("exchange", use: exchange)
-        api.post("refresh", use: refresh)
+        publicAuth.post("login", use: login)
+        publicAuth.post("register", use: register)
+        publicAuth.post("setup", use: setup)
+        publicAuth.post("exchange", use: exchange)
+        publicAuth.post("refresh", use: refresh)
 
-        // PROTECTED (Requires Valid JWT + Existing Grant)
+        publicAuth.get("oidc", ":provider", "start", use: oidcStart)
+        publicAuth.get("oidc", ":provider", "callback", use: oidcCallback)
+
         let protected = api.grouped(UserPayloadAuthenticator(), UserPayload.guardMiddleware())
 
         protected.post("logout", use: logout)
