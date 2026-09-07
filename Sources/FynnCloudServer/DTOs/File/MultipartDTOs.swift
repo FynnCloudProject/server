@@ -3,11 +3,13 @@ import Vapor
 // MARK: - Multipart Upload DTOs
 
 struct InitiateMultipartInput: Content {
+    let fileID: UUID?
     let filename: String
     let contentType: String
     let totalSize: Int64
     let parentID: UUID?
     let lastModified: Int64?  // Unix timestamp in milliseconds
+    let createdAt: Int64?  // Optional client-provided file creation timestamp in milliseconds
     let chunkSize: Int64?  // Optional, client can specify preferred chunk size
 }
 
