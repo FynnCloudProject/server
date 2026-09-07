@@ -1,0 +1,15 @@
+.build/
+.git/
+.gitignore
+.vscode/
+.github/
+Storage/
+backend-storage/
+*.sqlite
+*.sqlite-journal
+db.sqlite
+.env*
+Dockerfile
+*.md
+fynncloud-server-latest
+*.tar
