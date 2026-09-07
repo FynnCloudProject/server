@@ -13,6 +13,11 @@ on:
       - "main"
   workflow_dispatch:
 
+# Cancel superseded runs on the same ref so a rapid push doesn't queue behind a stale build
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build_and_push:
     name: Docker Build (${{ matrix.platform }})

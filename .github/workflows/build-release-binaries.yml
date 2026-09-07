@@ -71,7 +71,8 @@ jobs:
           mkdir -p "$STAGING_DIR"
 
           # Find the binary (it might be in a subfolder depending on arch)
-          find .build -name FynnCloudServer -type f -perm +111 -exec cp {} "$STAGING_DIR/" \;
+          # -perm /111 (not +111): GNU find (Linux runners) dropped the BSD-only +MODE syntax, /MODE works on both GNU and BSD find
+          find .build -name FynnCloudServer -type f -perm /111 -exec cp {} "$STAGING_DIR/" \;
 
           # Copy resources
           [ -d Public ] && cp -R Public "$STAGING_DIR/" || true
