@@ -1,7 +1,6 @@
 import JWT
 import Vapor
 
-// MARK: - Upload Session Authenticator
 
 struct UploadSessionAuthenticator: AsyncBearerAuthenticator {
     func authenticate(bearer: BearerAuthorization, for request: Request) async throws {
