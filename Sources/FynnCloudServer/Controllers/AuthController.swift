@@ -283,6 +283,17 @@ protected.delete("sessions", use: revokeOtherSessions)
             isHTTPOnly: true,
             sameSite: .lax
         )
+
+        response.cookies["fc_session"] = HTTPCookies.Value(
+            string: "1",
+            expires: Date().addingTimeInterval(refreshDuration),
+            maxAge: Int(refreshDuration),
+            domain: nil,
+            path: "/",
+            isSecure: isProduction,
+            isHTTPOnly: false,
+            sameSite: .lax
+        )
     }
 
     private func clearAuthCookies(response: Response, isProduction: Bool) {
