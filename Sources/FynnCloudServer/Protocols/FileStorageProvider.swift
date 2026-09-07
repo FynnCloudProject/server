@@ -1,53 +1,92 @@
 import Vapor
 
-// Abstraction for file storage to make it easy to switch between different storage providers
+// Represents the result of a save operation
+struct StorageSaveResult: Sendable {
+    let size: Int64
+    let hash: String
+}
+
+// Domain-agnostic abstraction for file and blob storage
 protocol FileStorageProvider: Sendable {
-    // Updated single-request upload methods - now return actual bytes written
     func save(
         stream: Request.Body,
-        id: UUID,
-        userID: UUID,
+        key: String,
         maxSize: Int64,
         on eventLoop: any EventLoop
-    ) async throws -> Int64  // Returns actual bytes written
+    ) async throws -> StorageSaveResult
 
-    func getResponse(for id: UUID, userID: UUID, on eventLoop: any EventLoop) async throws
-        -> Response
-    func delete(id: UUID, userID: UUID) async throws
-    func exists(id: UUID, userID: UUID) async throws -> Bool
+    func save(
+        buffer: ByteBuffer,
+        key: String,
+        contentType: String
+    ) async throws
 
-    // Updated multipart upload methods - now return actual bytes written
-    func initiateMultipartUpload(id: UUID, userID: UUID) async throws -> String
+    func getResponse(
+        key: String,
+        range: HTTPHeaders.Range?,
+        on eventLoop: any EventLoop
+    ) async throws -> Response
+
+    /// Streams the stored object at `key` directly to a local file at `path`, without buffering
+    /// the whole object in memory. Intended for server-side processing (e.g. thumbnailing).
+    func downloadToFile(
+        key: String,
+        path: String,
+        on eventLoop: any EventLoop
+    ) async throws
+
+    func delete(key: String) async throws
+    func exists(key: String) async throws -> Bool
+
+    /// Server-side copy of a stored object. Overwrites the destination if it already exists.
+    func copy(sourceKey: String, destinationKey: String) async throws
+
+    func initiateMultipartUpload(key: String) async throws -> String
 
     func uploadPart(
-        id: UUID,
-        userID: UUID,
+        key: String,
         uploadID: String,
         partNumber: Int,
         stream: Request.Body,
-        maxSize: Int64,  // Maximum allowed for this part
+        maxSize: Int64,
         on eventLoop: any EventLoop
-    ) async throws -> CompletedPart  // Now includes actual size
+    ) async throws -> CompletedPart
 
     func completeMultipartUpload(
-        id: UUID,
-        userID: UUID,
+        key: String,
         uploadID: String,
         parts: [CompletedPart]
-    ) async throws
+    ) async throws -> MultipartCompletionResult
 
-    func abortMultipartUpload(id: UUID, userID: UUID, uploadID: String) async throws
+    func abortMultipartUpload(key: String, uploadID: String) async throws
+
+    /// Sweeps partial multipart state left behind by sessions that were never completed or aborted.
+    func cleanupOrphanedChunkDirectories(olderThan: TimeInterval) async
+
+    func deleteUserData(userID: UUID) async throws
+}
+
+extension FileStorageProvider {
+    /// Providers that track multipart state remotely (e.g. S3) have nothing local to sweep.
+    func cleanupOrphanedChunkDirectories(olderThan: TimeInterval) async {}
 }
 
 // Represents a successfully uploaded part
 struct CompletedPart: Codable, Sendable {
     let partNumber: Int
     let etag: String
-    let size: Int64  // Actual bytes written for this part
+    let size: Int64
 
     init(partNumber: Int, etag: String, size: Int64) {
         self.partNumber = partNumber
         self.etag = etag
         self.size = size
     }
+}
+
+/// The hash plus the storage-verified real size of an assembled object. `size` is measured from
+/// the actual stored object, never trusted from client-declared part sizes.
+struct MultipartCompletionResult: Sendable {
+    let hash: String
+    let size: Int64
 }
