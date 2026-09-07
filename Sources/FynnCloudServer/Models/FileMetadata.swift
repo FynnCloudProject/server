@@ -25,14 +25,20 @@ final class FileMetadata: Model, Content, @unchecked Sendable {
     @Parent(key: "owner_id")
     var owner: User
 
-    @Timestamp(key: "created_at", on: .create)
+    @OptionalField(key: "created_at")
     var createdAt: Date?
+
+    @Timestamp(key: "uploaded_at", on: .create)
+    var uploadedAt: Date?
 
     @Timestamp(key: "updated_at", on: .update)
     var updatedAt: Date?
 
     @Field(key: "last_modified")
     var lastModified: Date?
+
+    @OptionalField(key: "hash")
+    var hash: String?
 
     @Timestamp(key: "deleted_at", on: .delete)
     var deletedAt: Date?
@@ -49,12 +55,20 @@ final class FileMetadata: Model, Content, @unchecked Sendable {
     @Field(key: "is_shared")
     var isShared: Bool
 
+    @Field(key: "has_thumbnail")
+    var hasThumbnail: Bool
+
+    @Field(key: "ancestor_ids")
+    var ancestorIDs: [UUID]
+
     init() {}
 
     init(
         id: UUID? = nil, filename: String, contentType: String, size: Int64,
         isDirectory: Bool = false, parentID: FileMetadata.IDValue? = nil, ownerID: User.IDValue,
-        isFavorite: Bool = false, isShared: Bool = false, lastModified: Date? = nil
+        isFavorite: Bool = false, isShared: Bool = false, createdAt: Date? = nil,
+        uploadedAt: Date? = nil, lastModified: Date? = nil, hash: String? = nil,
+        hasThumbnail: Bool = false, ancestorIDs: [UUID] = []
     ) {
         self.id = id
         self.filename = filename
@@ -65,6 +79,11 @@ final class FileMetadata: Model, Content, @unchecked Sendable {
         self.$owner.id = ownerID
         self.isFavorite = isFavorite
         self.isShared = isShared
+        self.createdAt = createdAt ?? lastModified ?? Date()
+        self.uploadedAt = uploadedAt
         self.lastModified = lastModified
+        self.hash = hash
+        self.hasThumbnail = hasThumbnail
+        self.ancestorIDs = ancestorIDs
     }
 }
