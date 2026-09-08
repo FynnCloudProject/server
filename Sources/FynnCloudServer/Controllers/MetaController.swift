@@ -12,8 +12,8 @@ struct MetaController: RouteCollection {
         let settings = req.application.settings
         let config = req.application.config
 
-        let appName = try await settings.get(AppSettings.AppName.self)
-        let primaryColor = try await settings.get(AppSettings.PrimaryColor.self)
+        let appNameSetting = try await settings.resolve(AppSettings.AppName.self)
+        let primaryColorSetting = try await settings.resolve(AppSettings.PrimaryColor.self)
         let euroOfficeURL = (try? await settings.get(AppSettings.DocumentServerURL.self)) ?? ""
         let registrationEnabled = (try? await UserService.isRegistrationAllowed(on: req.db, settings: settings)) ?? false
         let isSetupRequired = ((try? await User.query(on: req.db).count()) ?? 0) == 0
@@ -49,11 +49,11 @@ struct MetaController: RouteCollection {
         let aiEnabled = (try? await settings.get(AppSettings.AiEnabled.self)) ?? AppSettings.AiEnabled.defaultValue
 
         return ServerInfo(
-            appName: appName,
+            appName: appNameSetting.value,
             version: config.appVersion,
             maxFileSize: Int64(req.application.routes.defaultMaxBodySize.value),
             environment: req.application.environment.name,
-            primaryColor: primaryColor,
+            primaryColor: primaryColorSetting.value,
             officeEnabled: !euroOfficeURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             aiEnabled: aiEnabled,
             registrationEnabled: registrationEnabled,
@@ -64,7 +64,9 @@ struct MetaController: RouteCollection {
             showLogoAndName: showLogoAndName,
             svgColorMode: svgColorMode,
             hostname: hostname,
-            nodeName: nodeName
+            nodeName: nodeName,
+            isAppNameManagedByEnv: appNameSetting.isManagedByEnv,
+            isPrimaryColorManagedByEnv: primaryColorSetting.isManagedByEnv
         )
     }
 }
