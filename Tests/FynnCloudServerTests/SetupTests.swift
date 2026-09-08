@@ -8,10 +8,18 @@ import VaporTesting
 
 final class SetupTests: XCTestCase {
 
-    private func createTestApp() async throws -> Application {
+    private func createTestApp(appName: String? = nil, primaryColor: String? = nil) async throws -> Application {
         setenv("RATE_LIMIT_ENABLED", "false", 1)
-        setenv("APP_NAME", "", 1)
-        setenv("PRIMARY_COLOR", "", 1)
+        if let appName {
+            setenv("APP_NAME", appName, 1)
+        } else {
+            setenv("APP_NAME", "", 1)
+        }
+        if let primaryColor {
+            setenv("PRIMARY_COLOR", primaryColor, 1)
+        } else {
+            setenv("PRIMARY_COLOR", "", 1)
+        }
         setenv("REGISTRATION_ENABLED", "", 1)
         let app = try await Application.make(.testing)
         app.databases.use(.sqlite(.memory), as: .sqlite)
@@ -77,6 +85,8 @@ final class SetupTests: XCTestCase {
             XCTAssertEqual(res.status, .ok)
             let info = try res.content.decode(ServerInfo.self)
             XCTAssertTrue(info.isSetupRequired)
+            XCTAssertFalse(info.isAppNameManagedByEnv)
+            XCTAssertFalse(info.isPrimaryColorManagedByEnv)
         }
 
         let setupDTO = SetupDTO(
@@ -128,6 +138,30 @@ final class SetupTests: XCTestCase {
             try req.content.encode(secondAttemptDTO)
         }) { res async in
             XCTAssertEqual(res.status, .forbidden)
+        }
+    }
+
+    func testSetupWithEnvOverrides() async throws {
+        setenv("APP_NAME", "EnvCloud", 1)
+        setenv("PRIMARY_COLOR", "rose", 1)
+        defer {
+            setenv("APP_NAME", "", 1)
+            setenv("PRIMARY_COLOR", "", 1)
+        }
+
+        let app = try await createTestApp(appName: "EnvCloud", primaryColor: "rose")
+        defer {
+            Task { try? await app.asyncShutdown() }
+        }
+
+        try await app.testing().test(.GET, "api/info") { res async throws in
+            XCTAssertEqual(res.status, .ok)
+            let info = try res.content.decode(ServerInfo.self)
+            XCTAssertTrue(info.isSetupRequired)
+            XCTAssertEqual(info.appName, "EnvCloud")
+            XCTAssertEqual(info.primaryColor, "rose")
+            XCTAssertTrue(info.isAppNameManagedByEnv)
+            XCTAssertTrue(info.isPrimaryColorManagedByEnv)
         }
     }
 
