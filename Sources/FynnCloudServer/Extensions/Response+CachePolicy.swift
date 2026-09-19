@@ -27,3 +27,16 @@ extension Response {
         headers.replaceOrAdd(name: .cacheControl, value: policy.cacheControlValue)
     }
 }
+
+extension Response.Body {
+    /// Collects the body bytes asynchronously, bridging legacy NIO futures in Vapor 4
+    /// and paving the way for Vapor 5's native streaming collect.
+    func collectAsync() async throws -> ByteBuffer? {
+        if let buffer = self.buffer {
+            return buffer
+        }
+        let eventLoop = MultiThreadedEventLoopGroup.singleton.any()
+        return try await self.collect(on: eventLoop).get()
+    }
+}
+
