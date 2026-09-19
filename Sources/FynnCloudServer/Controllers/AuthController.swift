@@ -6,13 +6,8 @@ import Redis
 import Vapor
 
 struct AuthController: RouteCollection {
-    /// Allowed official OAuth client IDs for authentication
-    public static let allowedClientIDs: Set<String> = [
-        "fynncloud-web",
-        "fynncloud-desktop",
-        "fynncloud-ios",
-        "fynncloud-android",
-    ]
+    /// Allowed official OAuth client IDs for authentication (forwarded to `AuthService.allowedClientIDs`)
+    public static let allowedClientIDs: Set<String> = AuthService.allowedClientIDs
 
     func boot(routes: any RoutesBuilder) throws {
         let api = routes.grouped("api", "auth")
@@ -47,8 +42,8 @@ struct AuthController: RouteCollection {
                 LocalizationKeys.Error.Auth.InvalidClientId)
         }
 
-        let user = try await authenticate(
-            username: loginData.username, password: loginData.password, req: req)
+        let user = try await req.authService.authenticate(
+            usernameOrEmail: loginData.username, password: loginData.password)
         let userID = try user.requireID()
 
         // Enforce TOTP when the account has it enabled: without a code, signal the client to
@@ -63,7 +58,7 @@ struct AuthController: RouteCollection {
             else {
                 return AuthorizeResponse(callbackURL: "", code: nil, totpRequired: true)
             }
-            guard try await verifyTOTP(submitted, for: totp, req: req) else {
+            guard try await req.authService.verifyTOTP(submitted, for: totp) else {
                 req.logger(subsystem: .auth).warning(
                     "Failed login attempt: invalid TOTP code",
                     metadata: [
@@ -102,66 +97,7 @@ struct AuthController: RouteCollection {
         return response
     }
 
-    /// Resolves the login `User` from credentials: first the local bcrypt password, then any
-    /// configured credentials-based SSO provider (LDAP), which provisions/links via `SSOService`.
-    private func authenticate(username: String, password: String, req: Request) async throws -> User
-    {
-        if let user = try await User.query(on: req.db)
-            .group(
-                .or,
-                { query in
-                    query.filter(\.$username == username)
-                    query.filter(\.$email == username)
-                }
-            )
-            .first(),
-            (try? user.verify(password: password)) == true
-        {
-            return user
-        }
-
-        if let ldap = req.ssoProviders.credentialsProvider(id: "ldap") {
-            if let identity = try? await ldap.authenticate(
-                username: username, password: password, on: req)
-            {
-                return try await req.ssoService.resolveUser(identity)
-            }
-        }
-
-        req.logger(subsystem: .auth).warning(
-            "Failed login attempt: invalid credentials",
-            metadata: [
-                "username": .string(username),
-                "ip": .string(req.clientIP),
-            ]
-        )
-
-        throw Abort(.unauthorized, reason: "Invalid credentials").localized(
-            LocalizationKeys.Error.Auth.Credentials)
-    }
-
-    /// Verifies a login-time TOTP submission: first as a live time-based code, then as a
-    /// one-time recovery code (which is consumed on a match).
-    private func verifyTOTP(_ submitted: String, for totp: UserTOTP, req: Request) async throws
-        -> Bool
-    {
-        let secret = try req.secretBox.decrypt(totp.secret)
-        if TOTP.verify(code: submitted, secret: secret) { return true }
-        return try await totp.consumeRecoveryCode(submitted, on: req.db)
-    }
-
     // MARK: - OIDC redirect flow
-
-    /// Redis-persisted state for an in-flight OIDC login, keyed by the opaque `state` value.
-    private struct OIDCFlowState: Codable {
-        let nonce: String
-        let verifier: String
-        /// The client's PKCE challenge, carried through so the final `/exchange` works unchanged.
-        let clientChallenge: String
-        let clientID: String
-        let clientState: String?
-        let redirectURI: String
-    }
 
     /// Begins an OIDC login: stores flow state and redirects the browser to the provider.
     func oidcStart(req: Request) async throws -> Response {
@@ -192,13 +128,10 @@ struct AuthController: RouteCollection {
         let nonce = SSOToken.random()
         let pkce = PKCE.generate()
 
-        let flow = OIDCFlowState(
+        let flow = AuthService.OIDCFlowState(
             nonce: nonce, verifier: pkce.verifier, clientChallenge: clientChallenge,
             clientID: clientID, clientState: clientState, redirectURI: redirectURI)
-        let flowJSON = String(decoding: try JSONEncoder().encode(flow), as: UTF8.self)
-        let flowKey = RedisKey("oidc:flow:\(state)")
-        _ = try await req.redis.set(flowKey, to: flowJSON).get()
-        _ = try await req.redis.expire(flowKey, after: .seconds(600)).get()
+        try await req.authService.storeOIDCFlow(state: state, flow: flow)
 
         let url = try await provider.authorizationURL(
             state: state, nonce: nonce, pkce: pkce, on: req)
@@ -219,15 +152,7 @@ struct AuthController: RouteCollection {
         let code = try req.query.get(String.self, at: "code")
         let state = try req.query.get(String.self, at: "state")
 
-        // Load and consume the one-time flow state.
-        let flowKey = RedisKey("oidc:flow:\(state)")
-        guard let flowJSON = try await req.redis.get(flowKey, as: String.self).get(),
-            let flow = try? JSONDecoder().decode(
-                OIDCFlowState.self, from: Data(flowJSON.utf8))
-        else {
-            throw Abort(.unauthorized, reason: "Invalid or expired SSO state")
-        }
-        _ = try? await req.redis.delete(flowKey).get()
+        let flow = try await req.authService.consumeOIDCFlow(state: state)
 
         let identity = try await provider.exchange(
             code: code,
@@ -253,66 +178,7 @@ struct AuthController: RouteCollection {
 
     func exchange(req: Request) async throws -> Response {
         let dto = try req.content.decode(ExchangeDTO.self)
-
-        let codeKey = RedisKey("oauth:code:\(dto.code)")
-        guard let payloadJSON = try await req.redis.get(codeKey, as: String.self).get(),
-            let oauthPayload = try? JSONDecoder().decode(
-                OAuthCodePayload.self, from: Data(payloadJSON.utf8))
-        else {
-            throw Abort(.unauthorized, reason: "Code expired or invalid").localized(
-                LocalizationKeys.Error.Auth.ExchangeFailed)
-        }
-
-        // Delete code immediately to prevent replay attacks (single-use guarantee)
-        _ = try? await req.redis.delete(codeKey).get()
-
-        let hashedVerifier = SHA256.hash(data: Data(dto.code_verifier.utf8)).base64URLEncoded()
-        guard hashedVerifier == oauthPayload.codeChallenge else {
-            throw Abort(.unauthorized, reason: "Invalid verifier").localized(
-                LocalizationKeys.Error.Auth.ExchangeFailed)
-        }
-
-        guard Self.allowedClientIDs.contains(dto.clientId) else {
-            throw Abort(.unauthorized, reason: "Invalid client ID").localized(
-                LocalizationKeys.Error.Auth.InvalidClientId)
-        }
-
-        guard dto.clientId == oauthPayload.clientID else {
-            throw Abort(.unauthorized, reason: "Client ID mismatch").localized(
-                LocalizationKeys.Error.Auth.InvalidClientId)
-        }
-
-        guard let user = try await User.find(oauthPayload.userID, on: req.db) else {
-            throw Abort(.unauthorized, reason: "User not found").localized(
-                LocalizationKeys.Error.Http.Unauthorized)
-        }
-        let userID = try user.requireID()
-
-        try await user.$groups.load(on: req.db)
-        try await user.$tier.load(on: req.db)
-
-        let grant = OAuthGrant(
-            userID: userID,
-            clientID: oauthPayload.clientID,
-            userAgent: req.headers["User-Agent"].first ?? "",
-            ipAddress: req.clientIP
-        )
-        try await grant.save(on: req.db)
-        let grantID = try grant.requireID()
-
-        req.logger(subsystem: .auth).info(
-            "OAuth code exchanged for grant",
-            metadata: [
-                "user_id": .stringConvertible(userID),
-                "username": .string(user.username),
-                "grant_id": .stringConvertible(grantID),
-                "client_id": .string(oauthPayload.clientID),
-                "ip": .string(req.clientIP),
-            ]
-        )
-
-        let loginResponse = try await generateTokens(for: grant, req: req, user: user)
-        let isWeb = oauthPayload.clientID == "fynncloud-web"
+        let (loginResponse, user, isWeb) = try await req.authService.exchangeCode(dto: dto)
 
         // Same as in refresh, ensure SPA never sees an actual token
         let response =
@@ -342,46 +208,7 @@ struct AuthController: RouteCollection {
                 LocalizationKeys.Error.Http.Unauthorized)
         }
 
-        let payload = try await req.jwt.verify(refreshToken, as: UserPayload.self)
-
-        guard let grant = try await OAuthGrant.find(payload.grantID, on: req.db) else {
-            throw Abort(.unauthorized, reason: "Session revoked").localized(
-                LocalizationKeys.Error.Http.Unauthorized)
-        }
-
-        // Check if the token is the current refresh token, previous refresh token, or within the grace period
-        let tokenID = UUID(uuidString: payload.jti.value)
-        let isCurrentToken = tokenID == grant.currentRefreshTokenID
-        let isPreviousToken = tokenID == grant.previousRefreshTokenID
-        let isWithinGracePeriod: Bool = {
-            guard let lastRotatedAt = grant.lastRotatedAt else { return false }
-            // Allow a 30-second grace period for concurrent multi-tab or SSR token refresh race conditions
-            return Date().timeIntervalSince(lastRotatedAt) < 30
-        }()
-
-        if !isCurrentToken && !isPreviousToken {
-            if !isWithinGracePeriod {
-                // Revoke the whole session (grant) ONLY on reuse of a refresh token outside the 30s grace period
-                let revokedGrantID = try grant.requireID()
-                try await grant.delete(on: req.db)
-                await GrantValidityCache.invalidate(grantID: revokedGrantID, on: req.redis)
-                await SessionActivityService.remove(grantID: revokedGrantID, on: req.redis)
-                throw Abort(.unauthorized, reason: "Token reuse detected. Session terminated.")
-                    .localized(
-                        LocalizationKeys.Error.Http.Unauthorized)
-            }
-        }
-
-        guard let user = try await User.find(grant.$user.id, on: req.db) else {
-            throw Abort(.unauthorized).localized(LocalizationKeys.Error.Http.Unauthorized)
-        }
-
-        try await user.$groups.load(on: req.db)
-        try await user.$tier.load(on: req.db)
-
-        let loginResponse = try await generateTokens(for: grant, req: req, user: user)
-
-        let isWeb = grant.clientID == "fynncloud-web"
+        let (loginResponse, user, isWeb) = try await req.authService.rotateRefreshToken(rawToken: refreshToken)
 
         // on web for security reasons do not return the tokens in json so the SPA never has access to them
         let response =
@@ -397,41 +224,6 @@ struct AuthController: RouteCollection {
         }
 
         return response
-    }
-    // MARK: - Token Helpers
-
-    private func generateTokens(for grant: OAuthGrant, req: Request, user: User) async throws
-        -> LoginResponse
-    {
-        let grantID = try grant.requireID()
-        let userID = try user.requireID()
-        let newRefreshTokenID = UUID()
-
-        let accessPayload = UserPayload(
-            subject: .init(value: userID.uuidString),
-            expiration: .init(value: Date().addingTimeInterval(60 * 15)),
-            grantID: grantID,
-            jti: .init(value: UUID().uuidString)
-        )
-
-        let refreshDuration: TimeInterval = (grant.clientID != "fynncloud-web") ? 2_592_000 : 604800
-        let refreshPayload = UserPayload(
-            subject: .init(value: userID.uuidString),
-            expiration: .init(value: Date().addingTimeInterval(refreshDuration)),
-            grantID: grantID,
-            jti: .init(value: newRefreshTokenID.uuidString)
-        )
-
-        grant.previousRefreshTokenID = grant.currentRefreshTokenID
-        grant.lastRotatedAt = Date()
-        grant.currentRefreshTokenID = newRefreshTokenID
-        try await grant.save(on: req.db)
-
-        return try await LoginResponse(
-            accessToken: req.jwt.sign(accessPayload),
-            refreshToken: req.jwt.sign(refreshPayload),
-            user: user.toPublic()
-        )
     }
 
     // MARK: - Cookie Helpers
@@ -514,18 +306,7 @@ struct AuthController: RouteCollection {
 
     func logout(req: Request) async throws -> Response {
         let payload = try req.auth.require(UserPayload.self)
-
-        try await OAuthGrant.query(on: req.db)
-            .filter(\.$id == payload.grantID)
-            .delete()
-
-        req.logger(subsystem: .auth).info(
-            "User logged out",
-            metadata: [
-                "user_id": .string(payload.subject.value),
-                "grant_id": .stringConvertible(payload.grantID),
-            ]
-        )
+        try await req.authService.logout(grantID: payload.grantID, userID: payload.subject.value)
 
         let response = Response(status: .ok)
         clearAuthCookies(
@@ -539,39 +320,7 @@ struct AuthController: RouteCollection {
         guard let userID = UUID(uuidString: payload.subject.value) else {
             throw Abort(.unauthorized).localized(LocalizationKeys.Error.Http.Unauthorized)
         }
-
-        let grants = try await OAuthGrant.query(on: req.db)
-            .filter(\.$user.$id == userID)
-            .all()
-
-        guard !grants.isEmpty else { return [] }
-
-        let grantIDs = grants.compactMap { $0.id }
-        let redisActivity = await SessionActivityService.get(for: grantIDs, on: req.redis)
-
-        return grants.map { grant in
-            let activity = grant.id.flatMap { redisActivity[$0] }
-
-            var effectiveLastUsed = grant.lastUsedAt
-            if let ts = activity?.timestamp {
-                let bufferedDate = Date(timeIntervalSince1970: Double(ts))
-                if effectiveLastUsed == nil || bufferedDate > effectiveLastUsed! {
-                    effectiveLastUsed = bufferedDate
-                }
-            }
-
-            let effectiveIP = activity?.ipAddress ?? grant.ipAddress
-
-            return SessionResponse(
-                id: grant.id ?? UUID(),
-                clientID: grant.clientID,
-                userAgent: grant.userAgent,
-                ipAddress: effectiveIP,
-                createdAt: grant.createdAt,
-                lastUsedAt: effectiveLastUsed ?? grant.createdAt,
-                isCurrent: grant.id == payload.grantID
-            )
-        }
+        return try await req.authService.listSessions(userID: userID, currentGrantID: payload.grantID)
     }
 
     func revokeSession(req: Request) async throws -> HTTPStatus {
@@ -583,23 +332,7 @@ struct AuthController: RouteCollection {
             throw Abort(.badRequest).localized(LocalizationKeys.Error.Auth.MissingParams)
         }
 
-        // Ensure the user owns the grant they are trying to revoke
-        try await OAuthGrant.query(on: req.db)
-            .filter(\.$id == targetGrantID)
-            .filter(\.$user.$id == userID)
-            .delete()
-
-        await GrantValidityCache.invalidate(grantID: targetGrantID, on: req.redis)
-        await SessionActivityService.remove(grantID: targetGrantID, on: req.redis)
-
-        req.logger(subsystem: .auth).info(
-            "Session revoked",
-            metadata: [
-                "user_id": .stringConvertible(userID),
-                "target_grant_id": .stringConvertible(targetGrantID),
-            ]
-        )
-
+        try await req.authService.revokeSession(targetGrantID: targetGrantID, userID: userID)
         return .noContent
     }
 
@@ -609,29 +342,7 @@ struct AuthController: RouteCollection {
             throw Abort(.unauthorized).localized(LocalizationKeys.Error.Http.Unauthorized)
         }
 
-        let revokedGrantIDs = try await OAuthGrant.query(on: req.db)
-            .filter(\.$user.$id == userID)
-            .filter(\.$id != payload.grantID)
-            .all(\.$id)
-
-        guard !revokedGrantIDs.isEmpty else { return .noContent }
-
-        try await OAuthGrant.query(on: req.db)
-            .filter(\.$user.$id == userID)
-            .filter(\.$id != payload.grantID)
-            .delete()
-
-        await GrantValidityCache.invalidate(grantIDs: revokedGrantIDs, on: req.redis)
-        await SessionActivityService.remove(grantIDs: revokedGrantIDs, on: req.redis)
-
-        req.logger(subsystem: .auth).info(
-            "Other sessions revoked",
-            metadata: [
-                "user_id": .stringConvertible(userID),
-                "current_grant_id": .stringConvertible(payload.grantID),
-            ]
-        )
-
+        try await req.authService.revokeOtherSessions(currentGrantID: payload.grantID, userID: userID)
         return .noContent
     }
 
@@ -764,19 +475,5 @@ struct AuthController: RouteCollection {
             defaultRedirectURI: "fynncloud://auth",
             req: req
         )
-    }
-}
-
-extension Digest {
-    func base64URLEncoded() -> String {
-        let data = Data(self)
-        var base64 = data.base64EncodedString()
-
-        // Make URL-safe for PKCE
-        base64 = base64.replacingOccurrences(of: "+", with: "-")
-        base64 = base64.replacingOccurrences(of: "/", with: "_")
-        base64 = base64.replacingOccurrences(of: "=", with: "")
-
-        return base64
     }
 }
