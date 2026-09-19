@@ -41,7 +41,7 @@ public func configure(_ app: Application) async throws {
     }
 
     switch config.storage {
-    case .s3(let bucket):
+    case .s3(let bucket, let aws):
         app.logger(subsystem: .storage).info(
             "Using S3 storage provider",
             metadata: ["bucket": .string(bucket)]
@@ -54,8 +54,8 @@ public func configure(_ app: Application) async throws {
         )
         let awsClient = AWSClient(
             credentialProvider: .static(
-                accessKeyId: config.aws.accessKey,
-                secretAccessKey: config.aws.secretKey
+                accessKeyId: aws.accessKey,
+                secretAccessKey: aws.secretKey
             ),
             retryPolicy: .default,
             options: .init(),
@@ -66,8 +66,8 @@ public func configure(_ app: Application) async throws {
         app.lifecycle.use(AWSLifecycleHandler())
         app.fileStorage = S3StorageProvider(
             s3: S3(
-                client: awsClient, region: .init(awsRegionName: config.aws.region),
-                endpoint: config.aws.endpoint), bucket: bucket)
+                client: awsClient, region: .init(awsRegionName: aws.region),
+                endpoint: aws.endpoint), bucket: bucket)
 
     case .local(let path):
         app.logger(subsystem: .storage).info(
@@ -156,7 +156,10 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(AddFavoritesAndSharesToSyncTriggers())
     app.migrations.add(DropSyncTriggersMigration())
     app.migrations.add(CreateUserPasskeys())
-    if Environment.get("AUTO_MIGRATE") == "true" {
+    app.migrations.add(StandardizeSettingKeys())
+    app.migrations.add(AddActorToSyncLogMigration())
+    app.migrations.add(CreateFileActivitiesMigration())
+    if (Environment.first(matching: ["DATABASE_AUTO_MIGRATE", "AUTO_MIGRATE"]) ?? "").lowercased() == "true" {
         try await app.autoMigrate()
     }
 
@@ -182,9 +185,12 @@ public func configure(_ app: Application) async throws {
     app.queues.use(.redis(redisConfig))
     app.queues.add(ProcessFileEmbeddingJob())
     app.queues.add(GenerateThumbnailJob())
+    app.queues.add(SendEmailJob())
 
-    app.commands.use(ReindexFilesCommand(), as: "reindex-files")
-    app.commands.use(GenerateThumbnailsCommand(), as: "generate-thumbnails")
+    app.mail.use(.dynamic)
+
+    app.asyncCommands.use(ReindexFilesCommand(), as: "reindex-files")
+    app.asyncCommands.use(GenerateThumbnailsCommand(), as: "generate-thumbnails")
 
     try routes(app)
 
@@ -230,6 +236,9 @@ public func configure(_ app: Application) async throws {
     app.queues.schedule(SyncLogPruneJob())
         .daily()
         .at(3, 0)
+    app.queues.schedule(ActivityPruneJob())
+        .daily()
+        .at(3, 30)
     try app.queues.startScheduledJobs()
 }
 
