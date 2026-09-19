@@ -146,7 +146,9 @@ struct AuthService: @unchecked Sendable {
 
     /// Validates an incoming refresh token, verifies the grant and rotation state (permitting a 30s
     /// grace period for concurrent requests), revokes on reuse outside grace period, and mints new tokens.
-    func rotateRefreshToken(rawToken: String) async throws -> (loginResponse: LoginResponse, user: User, isWeb: Bool) {
+    func rotateRefreshToken(rawToken: String) async throws -> (
+        loginResponse: LoginResponse, user: User, isWeb: Bool
+    ) {
         let payload = try await jwt.verify(rawToken, as: UserPayload.self)
 
         guard let grant = try await OAuthGrant.find(payload.grantID, on: db) else {
@@ -194,7 +196,9 @@ struct AuthService: @unchecked Sendable {
 
     /// Validates an OAuth authorization code against Redis, validates the PKCE verifier challenge,
     /// creates an `OAuthGrant`, and issues new JWT tokens.
-    func exchangeCode(dto: ExchangeDTO) async throws -> (loginResponse: LoginResponse, user: User, isWeb: Bool) {
+    func exchangeCode(dto: ExchangeDTO) async throws -> (
+        loginResponse: LoginResponse, user: User, isWeb: Bool
+    ) {
         let codeKey = RedisKey("oauth:code:\(dto.code)")
         guard let payloadJSON = try await redis.get(codeKey, as: String.self).get(),
             let oauthPayload = try? JSONDecoder().decode(
@@ -276,7 +280,9 @@ struct AuthService: @unchecked Sendable {
     }
 
     /// Lists active sessions for a user, enriched with Redis session activity metrics.
-    func listSessions(userID: UUID, currentGrantID: UUID) async throws -> [SessionResponse] {
+    func listSessions(
+        userID: UUID, currentGrantID: UUID? = nil
+    ) async throws -> [SessionResponse] {
         let grants = try await OAuthGrant.query(on: db)
             .filter(\.$user.$id == userID)
             .all()
