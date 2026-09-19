@@ -18,10 +18,12 @@ func routes(_ app: Application) throws {
     let totpController = TOTPController()
     let passkeyController = PasskeyController()
     let aiController = AIController()
+    let activityController = ActivityController()
 
     let apiGroup = app.grouped(RateLimitMiddleware(category: .api))
 
     try apiGroup.register(collection: authController)
+    try apiGroup.register(collection: activityController)
     try apiGroup.register(collection: fileController)
     try apiGroup.register(collection: metaController)
     try apiGroup.register(collection: settingsController)
