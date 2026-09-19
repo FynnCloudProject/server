@@ -18,6 +18,7 @@ struct AdminController: RouteCollection {
         admin.post("ai", "test", use: testAIConnection)
         admin.post("ai", "test-embedding", use: testEmbeddingConnection)
         admin.post("ai", "reindex", use: reindexEmbeddings)
+        admin.post("mail", "test", use: testMailConnection)
     }
 
     func scheduledJobs(req: Request) async throws -> ScheduledJobsResponse {
@@ -160,7 +161,6 @@ struct AdminController: RouteCollection {
     func alerts(req: Request) async throws -> ServerAlertsResponse {
         let config = req.application.config
         let isProduction = req.application.environment == .production
-        let isDevelopment = req.application.environment == .development
         var alerts: [ServerAlert] = []
 
         if config.isJwtSecretDefault {
@@ -182,14 +182,14 @@ struct AdminController: RouteCollection {
                     key: LocalizationKeys.Admin.Alerts.LdapDefaultPassword,
                     severity: .critical,
                     message:
-                        "LDAP is enabled with a bind DN but no bind password. Set LDAP_BIND_PASSWORD to a strong, unique value."
+                        "LDAP is configured with a Bind DN but no Bind Password. Set LDAP_BIND_PASSWORD to a strong, unique value."
                 ))
         }
 
-        if case .s3 = config.storage, config.aws.accessKey.isEmpty || config.aws.secretKey.isEmpty {
+        if case .s3(_, let aws) = config.storage, aws.accessKey.isEmpty || aws.secretKey.isEmpty {
             alerts.append(
                 ServerAlert(
-                    key: "admin.alerts.s3CredentialsMissing",
+                    key: LocalizationKeys.Admin.Alerts.S3CredentialsMissing,
                     severity: .critical,
                     message:
                         "Object storage is enabled but its credentials are missing. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY so file storage keeps working."
@@ -199,14 +199,77 @@ struct AdminController: RouteCollection {
         if (try? await req.redis.ping().get()) == nil {
             alerts.append(
                 ServerAlert(
-                    key: "admin.alerts.redisUnreachable",
+                    key: LocalizationKeys.Admin.Alerts.RedisUnreachable,
                     severity: .warning,
                     message:
                         "Redis isn't responding. Sessions, rate limiting and scheduled-job tracking may not work correctly. Check REDIS_URL and that Redis is running."
                 ))
         }
 
-        if isProduction || isDevelopment {
+        // SSO Configuration Checks
+        let oidcEnabled = (try? await req.application.settings.get(AppSettings.OidcEnabled.self)) ?? AppSettings.OidcEnabled.defaultValue
+        if oidcEnabled {
+            let issuer = ((try? await req.application.settings.get(AppSettings.OidcIssuerURL.self)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let clientID = ((try? await req.application.settings.get(AppSettings.OidcClientID.self)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if issuer.isEmpty || clientID.isEmpty {
+                alerts.append(
+                    ServerAlert(
+                        key: LocalizationKeys.Admin.Alerts.OidcMisconfigured,
+                        severity: .warning,
+                        message:
+                            "Single Sign-On (OIDC) is enabled but missing required configuration (Issuer URL or Client ID)."
+                    ))
+            }
+        }
+
+        let ldapEnabled = (try? await req.application.settings.get(AppSettings.LdapEnabled.self)) ?? AppSettings.LdapEnabled.defaultValue
+        if ldapEnabled {
+            let host = ((try? await req.application.settings.get(AppSettings.LdapHost.self)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let baseDN = ((try? await req.application.settings.get(AppSettings.LdapBaseDN.self)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if host.isEmpty || baseDN.isEmpty {
+                alerts.append(
+                    ServerAlert(
+                        key: LocalizationKeys.Admin.Alerts.LdapMisconfigured,
+                        severity: .warning,
+                        message:
+                            "LDAP authentication is enabled but missing required connection settings (Host or Base DN)."
+                    ))
+            }
+        }
+
+        // AI & Embeddings Configuration Checks
+        let aiEnabled = (try? await req.application.settings.get(AppSettings.AiEnabled.self)) ?? AppSettings.AiEnabled.defaultValue
+        if aiEnabled {
+            let aiUrl = ((try? await req.application.settings.get(AppSettings.AiApiUrl.self)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let aiKey = ((try? await req.application.settings.get(AppSettings.AiApiKey.self)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let isOpenAI = aiUrl.contains("openai.com")
+            if aiUrl.isEmpty || (isOpenAI && aiKey.isEmpty) {
+                alerts.append(
+                    ServerAlert(
+                        key: LocalizationKeys.Admin.Alerts.AiMisconfigured,
+                        severity: .warning,
+                        message:
+                            "AI assistant is enabled but missing required configuration (API key or URL). Configure your provider in AI Settings."
+                    ))
+            }
+        }
+
+        let embeddingEnabled = (try? await req.application.settings.get(AppSettings.EmbeddingEnabled.self)) ?? AppSettings.EmbeddingEnabled.defaultValue
+        if embeddingEnabled {
+            let embUrl = ((try? await req.application.settings.get(AppSettings.EmbeddingUrl.self)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if embUrl.isEmpty {
+                alerts.append(
+                    ServerAlert(
+                        key: LocalizationKeys.Admin.Alerts.EmbeddingsMisconfigured,
+                        severity: .warning,
+                        message:
+                            "Vector embeddings are enabled, but the embedding runner URL is empty. Semantic search may be unavailable."
+                    ))
+            }
+        }
+
+        // Production-specific checks
+        if isProduction {
             if case .sqlite = config.database {
                 alerts.append(
                     ServerAlert(
@@ -214,6 +277,16 @@ struct AdminController: RouteCollection {
                         severity: .warning,
                         message:
                             "SQLite is in use. For production traffic, switch to PostgreSQL for better reliability under load."
+                    ))
+            }
+
+            if case .local = config.storage {
+                alerts.append(
+                    ServerAlert(
+                        key: LocalizationKeys.Admin.Alerts.LocalStorageInProduction,
+                        severity: .info,
+                        message:
+                            "Files are stored on the local disk. For production deployments, S3-compatible object storage is recommended."
                     ))
             }
 
@@ -236,13 +309,11 @@ struct AdminController: RouteCollection {
                             "The instance isn't being served over HTTPS. Enable HTTPS so traffic stays encrypted in transit."
                     ))
             }
-        }
 
-        if isProduction {
             if !config.rateLimitEnabled {
                 alerts.append(
                     ServerAlert(
-                        key: "admin.alerts.rateLimitDisabled",
+                        key: LocalizationKeys.Admin.Alerts.RateLimitDisabled,
                         severity: .warning,
                         message:
                             "Rate limiting is turned off. Enable RATE_LIMIT_ENABLED to help protect against brute-force and abuse."
@@ -252,10 +323,21 @@ struct AdminController: RouteCollection {
             if config.frontendURL.contains("localhost") {
                 alerts.append(
                     ServerAlert(
-                        key: "admin.alerts.frontendUrlLocalhost",
+                        key: LocalizationKeys.Admin.Alerts.FrontendUrlLocalhost,
                         severity: .warning,
                         message:
                             "FRONTEND_URL is still set to localhost. Set it to your public address so email links, sharing and CORS work correctly."
+                    ))
+            }
+
+            let registrationEnabled = (try? await req.application.settings.get(AppSettings.RegistrationEnabled.self)) ?? AppSettings.RegistrationEnabled.defaultValue
+            if registrationEnabled {
+                alerts.append(
+                    ServerAlert(
+                        key: LocalizationKeys.Admin.Alerts.OpenRegistrationInProduction,
+                        severity: .info,
+                        message:
+                            "Public user registration is enabled on this production instance. Anyone with network access can register an account."
                     ))
             }
         }
@@ -269,8 +351,22 @@ struct AdminController: RouteCollection {
                     key: LocalizationKeys.Admin.Alerts.InstanceNameDefault,
                     severity: .info,
                     message:
-                        "You're still using the default instance name, 'FynnCloud'. Set the APP_NAME environment variable to show your own branding."
+                        "You're still using the default instance name, 'FynnCloud'. You can customize your instance name and branding in Admin Settings."
                 ))
+        }
+
+        if let subInfo = try? await req.application.subscription.info() {
+            let now = Date()
+            let expDate = subInfo.payload.expiration.value
+            if now > expDate {
+                alerts.append(
+                    ServerAlert(
+                        key: LocalizationKeys.Admin.Alerts.SubscriptionInGracePeriod,
+                        severity: .warning,
+                        message:
+                            "Your subscription has expired and is currently in its 7-day grace period. Renew your subscription to prevent service interruption."
+                    ))
+            }
         }
 
         if let maxUsers = await req.application.subscription.effectiveMaxUsers() {
@@ -283,7 +379,7 @@ struct AdminController: RouteCollection {
                     : "You've reached the free user limit (\(userCount)/\(maxUsers)). Add a subscription key to register more."
                 alerts.append(
                     ServerAlert(
-                        key: "admin.alerts.userLimitReached",
+                        key: LocalizationKeys.Admin.Alerts.UserLimitReached,
                         severity: .warning,
                         message: msg
                     ))
@@ -483,5 +579,52 @@ struct AdminController: RouteCollection {
             queued: files.count,
             message: "Queued \(files.count) files for embedding generation"
         )
+    }
+
+    struct TestMailRequest: Content {
+        let recipient: String?
+    }
+
+    struct TestMailResponse: Content {
+        let success: Bool
+        let message: String
+    }
+
+    func testMailConnection(req: Request) async throws -> TestMailResponse {
+        let payload = try? req.content.decode(TestMailRequest.self)
+        let adminID = try req.auth.require(UserPayload.self).getID()
+        let admin = try await User.find(adminID, on: req.db)
+
+        let recipientStr: String
+        if let custom = payload?.recipient?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
+            recipientStr = custom
+        } else if let email = admin?.email, !email.isEmpty {
+            recipientStr = email
+        } else {
+            throw Abort(.badRequest, reason: "No recipient email provided and logged-in admin user has no email address.")
+        }
+
+        let appName = (try? await req.application.settings.get(AppSettings.AppName.self)) ?? AppSettings.AppName.defaultValue
+
+        let fields = [
+            "recipient": recipientStr,
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "driver": Environment.get("MAIL_DRIVER") ?? "default",
+            "appName": appName
+        ]
+
+        do {
+            try await req.mail.sendTemplate(
+                id: "test_email",
+                to: EmailAddress(address: recipientStr, name: admin?.displayName ?? admin?.username),
+                subject: "Test Email from \(appName)",
+                fields: fields
+            )
+            req.logger(subsystem: .admin).info("Admin triggered test email successfully sent to \(recipientStr)")
+            return TestMailResponse(success: true, message: "Test email successfully sent to \(recipientStr)")
+        } catch {
+            req.logger(subsystem: .admin).error("Failed to send test email to \(recipientStr): \(error)")
+            throw Abort(.internalServerError, reason: "Failed to send test email: \(error)")
+        }
     }
 }
