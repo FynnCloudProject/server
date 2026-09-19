@@ -65,21 +65,40 @@ public struct RateLimitMiddleware: AsyncMiddleware {
     }
 
     public func respond(to req: Request, chainingTo next: any AsyncResponder) async throws -> Response {
-        let config = req.application.config
+        let isEnabled: Bool
+        if let settings = req.application.optionalSettings {
+            isEnabled = (try? await settings.get(AppSettings.RateLimitEnabled.self)) ?? AppSettings.RateLimitEnabled.defaultValue
+        } else {
+            isEnabled = AppSettings.RateLimitEnabled.envValue.flatMap(Bool.init) ?? AppSettings.RateLimitEnabled.defaultValue
+        }
 
-        guard config.rateLimitEnabled else {
+        guard isEnabled else {
             return try await next.respond(to: req)
         }
 
         let limit: Int
-        if category == .ai {
-            if let settings = req.application.optionalSettings {
+        if let settings = req.application.optionalSettings {
+            switch category {
+            case .auth:
+                limit = (try? await settings.get(AppSettings.RateLimitAuth.self)) ?? AppSettings.RateLimitAuth.defaultValue
+            case .share:
+                limit = (try? await settings.get(AppSettings.RateLimitShare.self)) ?? AppSettings.RateLimitShare.defaultValue
+            case .api:
+                limit = (try? await settings.get(AppSettings.RateLimitAPI.self)) ?? AppSettings.RateLimitAPI.defaultValue
+            case .ai:
                 limit = (try? await settings.get(AppSettings.RateLimitAi.self)) ?? AppSettings.RateLimitAi.defaultValue
-            } else {
-                limit = AppSettings.RateLimitAi.defaultValue
             }
         } else {
-            limit = category.limit(config: config)
+            switch category {
+            case .auth:
+                limit = AppSettings.RateLimitAuth.envValue.flatMap(Int.init) ?? AppSettings.RateLimitAuth.defaultValue
+            case .share:
+                limit = AppSettings.RateLimitShare.envValue.flatMap(Int.init) ?? AppSettings.RateLimitShare.defaultValue
+            case .api:
+                limit = AppSettings.RateLimitAPI.envValue.flatMap(Int.init) ?? AppSettings.RateLimitAPI.defaultValue
+            case .ai:
+                limit = AppSettings.RateLimitAi.envValue.flatMap(Int.init) ?? AppSettings.RateLimitAi.defaultValue
+            }
         }
         let windowSeconds = category.windowSeconds
 
