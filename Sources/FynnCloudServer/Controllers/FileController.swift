@@ -32,7 +32,6 @@ struct FileController: RouteCollection {
 
         protected.get(":fileID", "download", use: download)
         protected.get(":fileID", "thumbnail", use: thumbnail)
-        protected.get(":fileID", "activity", use: activity)
 
         // Everything that acts on a set of files takes an id array, a single file being `[id]`.
         protected.post("move", use: moveMany)
@@ -95,21 +94,6 @@ struct FileController: RouteCollection {
         let userID = try req.auth.require(UserPayload.self).getID()
         let fileID = try req.parameters.require("fileID", as: UUID.self)
         return try await req.fileListing.itemDTO(fileID: fileID, userID: userID)
-    }
-
-    func activity(req: Request) async throws -> ActivityResponse {
-        let userID = try req.auth.require(UserPayload.self).getID()
-        let fileID = try req.parameters.require("fileID", as: UUID.self)
-        let params = try req.query.decode(ActivityRequest.self)
-
-        return try await SyncController.fetchActivity(
-            db: req.db,
-            fileAccess: req.fileAccess,
-            userID: userID,
-            fileID: fileID,
-            page: params.page ?? 1,
-            limit: params.limit ?? 30
-        )
     }
 
     func favorites(req: Request) async throws -> FileIndexDTO {
@@ -254,7 +238,7 @@ struct FileController: RouteCollection {
     /// Embeddings power semantic search; a failure to enqueue must not fail the write itself.
     private func dispatchEmbeddingJob(req: Request, fileID: UUID) async {
         let isEnabled =
-            (try? await req.application.settings.get(AppSettings.EmbeddingEnabled.self)) ?? true
+            (try? await req.application.settings.get(AppSettings.EmbeddingEnabled.self)) ?? AppSettings.EmbeddingEnabled.defaultValue
         guard isEnabled else { return }
 
         do {
