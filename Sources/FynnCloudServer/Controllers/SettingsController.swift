@@ -1,60 +1,187 @@
 import Foundation
 import Vapor
 
-/// Admin CRUD for dynamic application settings and branding assets. Validation and env-guarding live in `SettingsService`.
+/// Controller for application settings and branding assets.
+/// Presentation boundary handles group filtering, public vs admin scoping, and secret redaction.
 struct SettingsController: RouteCollection {
 
     func boot(routes: any RoutesBuilder) throws {
         let api = routes.grouped("api")
 
+        // Public branding asset streams
         api.get("branding", "logo", use: getLogo)
         api.get("branding", "icon", use: getIcon)
 
-        let admin = api.grouped(
+        // Public settings endpoints (unauthenticated; returns only visibility == .public)
+        api.get("settings", "public", use: getPublicSettings)
+        api.get("public", "settings", use: getPublicSettings)
+
+        // Admin settings endpoints (requires authenticated administrator)
+        let adminAuth = api.grouped(
             UserPayloadAuthenticator(), UserPayload.guardMiddleware(), AdminMiddleware())
-        admin.get("settings", use: getSettings)
-        admin.put("settings", use: updateSettings)
-        admin.post("settings", "branding", "logo", use: uploadLogo)
-        admin.delete("settings", "branding", "logo", use: deleteLogo)
-        admin.post("settings", "branding", "icon", use: uploadIcon)
-        admin.delete("settings", "branding", "icon", use: deleteIcon)
+        adminAuth.get("settings", use: getAdminSettings)
+        adminAuth.put("settings", use: updateSettings)
+        adminAuth.post("settings", "branding", "logo", use: uploadLogo)
+        adminAuth.delete("settings", "branding", "logo", use: deleteLogo)
+        adminAuth.post("settings", "branding", "icon", use: uploadIcon)
+        adminAuth.delete("settings", "branding", "icon", use: deleteIcon)
+
+        // Also alias under /api/admin/settings for RESTful scoping
+        let adminPrefixed = api.grouped("admin").grouped(
+            UserPayloadAuthenticator(), UserPayload.guardMiddleware(), AdminMiddleware())
+        adminPrefixed.get("settings", use: getAdminSettings)
+        adminPrefixed.put("settings", use: updateSettings)
     }
 
-    /// GET /api/settings?keys=a,b,c - callers that only need a subset (e.g. one admin settings
-    /// section) can pass a comma-separated `keys` list instead of always resolving every setting.
-    /// Unknown keys are silently ignored; omitting `keys` keeps the original resolve-everything behavior.
-    func getSettings(req: Request) async throws -> SettingsResponse {
-        let settings = req.application.settings
-        guard let keysParam = req.query[String.self, at: "keys"],
-            !keysParam.trimmingCharacters(in: .whitespaces).isEmpty
-        else {
-            return try await settings.resolveAll()
+    // MARK: - Presentation Layer Projections
+
+    private func projectToDTO(keyType: any AnySettingKey.Type, rawManaged: ManagedSetting<String>) -> SettingDTO {
+        let isConfigured: Bool
+        if rawManaged.isManagedByEnv {
+            isConfigured = true
+        } else {
+            isConfigured = !rawManaged.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
 
-        let requestedKeys = Set(
-            keysParam.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
-        var result = SettingsResponse()
-        for keyType in AppSettings.all where requestedKeys.contains(keyType.key) {
-            result[keyType.key] = try await settings.resolveAny(keyType)
+        let exposedValue: String?
+        if keyType.visibility == .secret {
+            exposedValue = nil // Masked/redacted in read APIs
+        } else {
+            exposedValue = rawManaged.value
         }
+
+        return SettingDTO(
+            key: keyType.key,
+            value: exposedValue,
+            isManagedByEnv: rawManaged.isManagedByEnv,
+            isConfigured: isConfigured,
+            visibility: keyType.visibility,
+            group: keyType.group,
+            envVar: keyType.envKeys.first,
+            envKeys: keyType.envKeys
+        )
+    }
+
+    private func filterCandidates(
+        from base: [any AnySettingKey.Type],
+        req: Request
+    ) throws -> (candidates: [any AnySettingKey.Type], requestedKeys: Set<String>?) {
+        var candidates = base
+
+        let groupParam = req.query[String.self, at: "group"] ?? req.query[String.self, at: "groups"]
+        if let groupParam = groupParam, !groupParam.trimmingCharacters(in: .whitespaces).isEmpty {
+            let groupNames = groupParam.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            var groups = Set<SettingGroup>()
+            for name in groupNames {
+                guard let group = SettingGroup(rawValue: name) else {
+                    throw Abort(.badRequest, reason: "Invalid setting group: \(name)")
+                }
+                groups.insert(group)
+            }
+            candidates = candidates.filter { groups.contains($0.group) }
+        }
+
+        var requestedKeys: Set<String>? = nil
+        if let keysParam = req.query[String.self, at: "keys"],
+            !keysParam.trimmingCharacters(in: .whitespaces).isEmpty
+        {
+            let rawSet = Set(keysParam.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+            requestedKeys = rawSet
+            let mappedKeys = Set(rawSet.map { AppSettings.legacyKeyAliases[$0] ?? $0 })
+            candidates = candidates.filter { mappedKeys.contains($0.key) }
+        }
+
+        return (candidates, requestedKeys)
+    }
+
+    private func projectCandidates(
+        _ candidates: [any AnySettingKey.Type],
+        requestedKeys: Set<String>? = nil,
+        settings: SettingsService
+    ) async throws -> SettingsResponse {
+        guard !candidates.isEmpty else { return SettingsResponse() }
+
+        let resolved = try await settings.resolveKeys(candidates)
+        var result = SettingsResponse()
+        result.reserveCapacity(candidates.count + (requestedKeys?.count ?? 0))
+
+        for keyType in candidates {
+            guard let rawManaged = resolved[keyType.key] else { continue }
+            let dto = projectToDTO(keyType: keyType, rawManaged: rawManaged)
+            result[keyType.key] = dto
+
+            for (legacyAlias, canonical) in AppSettings.legacyKeyAliases
+            where canonical == keyType.key && (requestedKeys?.contains(legacyAlias) ?? true) {
+                result[legacyAlias] = SettingDTO(
+                    key: legacyAlias,
+                    value: dto.value,
+                    isManagedByEnv: dto.isManagedByEnv,
+                    isConfigured: dto.isConfigured,
+                    visibility: dto.visibility,
+                    group: dto.group,
+                    envVar: dto.envVar,
+                    envKeys: dto.envKeys
+                )
+            }
+        }
+
         return result
     }
 
+    private func resolveAndProjectAll(settings: SettingsService) async throws -> SettingsResponse {
+        try await projectCandidates(AppSettings.all, settings: settings)
+    }
+
+    // MARK: - Setting Endpoints
+
+    /// GET /api/settings/public - Unauthenticated public endpoint returning only `.public` settings.
+    /// Supports optional `?group=` and `?keys=` filtering.
+    func getPublicSettings(req: Request) async throws -> SettingsResponse {
+        let (candidates, requestedKeys) = try filterCandidates(
+            from: AppSettings.all.filter { $0.visibility == .public },
+            req: req
+        )
+        return try await projectCandidates(candidates, requestedKeys: requestedKeys, settings: req.settings)
+    }
+
+    /// GET /api/admin/settings (or GET /api/settings) - Admin endpoint returning settings with secret redaction.
+    /// Supports `?group=sso` for coarse backend query partition, and `?keys=keyA,keyB` for dashboard views.
+    func getAdminSettings(req: Request) async throws -> SettingsResponse {
+        let (candidates, requestedKeys) = try filterCandidates(
+            from: AppSettings.all,
+            req: req
+        )
+        return try await projectCandidates(candidates, requestedKeys: requestedKeys, settings: req.settings)
+    }
+
+    /// PUT /api/admin/settings (or PUT /api/settings) - Admin mutation endpoint.
+    /// Preserves existing values if a client submits an empty or null string for a `.secret`.
     func updateSettings(req: Request) async throws -> SettingsResponse {
-        let input = try req.content.decode([String: String].self)
-        let settings = req.application.settings
+        let input = try req.content.decode([String: String?].self)
+        let settings = req.settings
 
         var touchedSSO = false
         var touchedDocumentServerURL: (previous: String?, new: String)? = nil
+        var modifiedKeyTypes: [any AnySettingKey.Type] = []
 
-        for (key, val) in input {
+        for (key, rawValOpt) in input {
             guard let keyType = AppSettings.find(key) else { continue }
-            if key == AppSettings.DocumentServerURL.key {
-                let previous = try? await settings.get(AppSettings.DocumentServerURL.self)
+            let val = rawValOpt ?? ""
+
+            // Safe secret update: empty or whitespace string does not overwrite existing secret
+            if keyType.visibility == .secret && val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                modifiedKeyTypes.append(keyType)
+                continue
+            }
+
+            if keyType.key == AppSettings.DocsServerUrl.key {
+                let previous = try? await settings.get(AppSettings.DocsServerUrl.self)
                 touchedDocumentServerURL = (previous: previous, new: val)
             }
+
             try await settings.setGuardedAny(keyType, value: val)
-            if AppSettings.ssoKeys.contains(key) { touchedSSO = true }
+            modifiedKeyTypes.append(keyType)
+            if keyType.group == .sso { touchedSSO = true }
         }
 
         // Invalidate WOPI discovery cache if document server URL changed
@@ -73,29 +200,26 @@ struct SettingsController: RouteCollection {
         }
 
         let adminID = try? req.auth.require(UserPayload.self).getID()
-        let modifiedKeys = input.keys.filter { AppSettings.find($0) != nil }
         req.logger(subsystem: .admin).info(
             "Admin updated cluster settings",
             metadata: [
                 "admin_user_id": .stringConvertible(adminID ?? UUID()),
-                "modified_keys": .array(modifiedKeys.map { .string($0) }),
+                "modified_keys": .array(modifiedKeyTypes.map { .string($0.key) }),
             ]
         )
 
-        // Mirror getSettings: only resolve the keys that were actually sent, so a section save
-        // doesn't pull (and re-cache) every other setting on the client.
-        var result = SettingsResponse()
-        for key in modifiedKeys {
-            guard let keyType = AppSettings.find(key) else { continue }
-            result[key] = try await settings.resolveAny(keyType)
-        }
-        return result
+        // Return projected DTOs for modified keys (mirroring getSettings)
+        return try await projectCandidates(
+            modifiedKeyTypes,
+            requestedKeys: Set(input.keys),
+            settings: settings
+        )
     }
 
     // MARK: - Branding Operations
 
     func getLogo(req: Request) async throws -> Response {
-        let settings = req.application.settings
+        let settings = req.settings
         let updatedAt = try await settings.get(AppSettings.CustomLogoUpdatedAt.self)
         guard !updatedAt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw Abort(.notFound, reason: "No custom logo configured")
@@ -113,7 +237,7 @@ struct SettingsController: RouteCollection {
     }
 
     func getIcon(req: Request) async throws -> Response {
-        let settings = req.application.settings
+        let settings = req.settings
         let updatedAt = try await settings.get(AppSettings.CustomIconUpdatedAt.self)
         guard !updatedAt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw Abort(.notFound, reason: "No custom icon configured")
@@ -166,11 +290,11 @@ struct SettingsController: RouteCollection {
         )
 
         let timestamp = String(Int(Date().timeIntervalSince1970))
-        let settings = req.application.settings
+        let settings = req.settings
         try await settings.setGuarded(AppSettings.CustomLogoUpdatedAt.self, value: timestamp)
         try await settings.setGuarded(AppSettings.CustomLogoMimeType.self, value: mimeType)
 
-        return try await settings.resolveAll()
+        return try await resolveAndProjectAll(settings: settings)
     }
 
     func deleteLogo(req: Request) async throws -> SettingsResponse {
@@ -181,11 +305,11 @@ struct SettingsController: RouteCollection {
             req.logger(subsystem: .storage).warning("Failed to delete branding logo file: \(error)")
         }
 
-        let settings = req.application.settings
+        let settings = req.settings
         try await settings.setGuarded(AppSettings.CustomLogoUpdatedAt.self, value: "")
         try await settings.setGuarded(AppSettings.CustomLogoMimeType.self, value: "")
 
-        return try await settings.resolveAll()
+        return try await resolveAndProjectAll(settings: settings)
     }
 
     func uploadIcon(req: Request) async throws -> SettingsResponse {
@@ -224,11 +348,11 @@ struct SettingsController: RouteCollection {
         )
 
         let timestamp = String(Int(Date().timeIntervalSince1970))
-        let settings = req.application.settings
+        let settings = req.settings
         try await settings.setGuarded(AppSettings.CustomIconUpdatedAt.self, value: timestamp)
         try await settings.setGuarded(AppSettings.CustomIconMimeType.self, value: mimeType)
 
-        return try await settings.resolveAll()
+        return try await resolveAndProjectAll(settings: settings)
     }
 
     func deleteIcon(req: Request) async throws -> SettingsResponse {
@@ -239,10 +363,10 @@ struct SettingsController: RouteCollection {
             req.logger(subsystem: .storage).warning("Failed to delete branding icon file: \(error)")
         }
 
-        let settings = req.application.settings
+        let settings = req.settings
         try await settings.setGuarded(AppSettings.CustomIconUpdatedAt.self, value: "")
         try await settings.setGuarded(AppSettings.CustomIconMimeType.self, value: "")
 
-        return try await settings.resolveAll()
+        return try await resolveAndProjectAll(settings: settings)
     }
 }

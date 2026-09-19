@@ -1,5 +1,5 @@
-import Foundation
 import Fluent
+import Foundation
 import Redis
 import Vapor
 
@@ -45,50 +45,64 @@ actor SettingsService {
         return Date().timeIntervalSince(cacheLoadedAt) < ttl
     }
 
+    /// Loads the settings table into memory.
+    /// Uses cooperative yielding and retry boundaries to safely handle actor reentrancy
+    /// without spinning the cooperative thread pool.
     private func loadIfNeeded() async throws {
-        if isCacheValid { return }
+        var attempts = 0
+        while !isCacheValid {
+            attempts += 1
+            if attempts > 3 {
+                // If invalidations or writes arrive faster than we can load, yield cooperatively
+                await Task.yield()
+                if attempts > 10 {
+                    logger.scoped(to: .system).warning("SettingsService loadIfNeeded exceeded max retry attempts; continuing with available state")
+                    break
+                }
+            }
 
-        // If a load task is already in-flight, await its completion to avoid duplicate queries.
-        if let existingTask = inFlightLoad {
+            if let existingTask = inFlightLoad {
+                _ = try await existingTask.value
+                continue
+            }
+
+            let db = self.database
             let startGeneration = generation
-            let loaded = try await existingTask.value
-            install(loaded, ifStillAt: startGeneration)
-            return
-        }
+            let loadTask = Task<[String: String], any Error> {
+                let rows = try await AppSetting.query(on: db).all()
+                return Dictionary(
+                    uniqueKeysWithValues: rows.compactMap { row in
+                        guard let key = row.id else { return nil }
+                        return (key, row.value)
+                    })
+            }
 
-        let db = self.database
-        let loadTask = Task<[String: String], any Error> {
-            let rows = try await AppSetting.query(on: db).all()
-            return Dictionary(uniqueKeysWithValues: rows.compactMap { row in
-                guard let key = row.id else { return nil }
-                return (key, row.value)
-            })
-        }
+            self.inFlightLoad = loadTask
 
-        self.inFlightLoad = loadTask
-        let startGeneration = generation
-
-        do {
-            let result = try await loadTask.value
-            install(result, ifStillAt: startGeneration)
-            self.inFlightLoad = nil
-        } catch {
-            self.inFlightLoad = nil
-            throw error
+            do {
+                let result = try await loadTask.value
+                install(result, ifStillAt: startGeneration)
+                self.inFlightLoad = nil
+            } catch {
+                self.inFlightLoad = nil
+                throw error
+            }
         }
     }
 
-    /// Installs a freshly loaded snapshot unless a write or invalidation landed while it was
-    /// in flight - actor reentrancy means the snapshot would otherwise silently revert that change.
+    /// Installs a freshly loaded snapshot unless a write landed while it was in flight.
+    /// If cache is currently nil (e.g. after clearCache()), we always install the database snapshot
+    /// so callers are not left with a nil cache causing an infinite load loop.
     private func install(_ snapshot: [String: String], ifStillAt startGeneration: UInt64) {
-        guard generation == startGeneration else { return }
-        cache = snapshot
-        cacheLoadedAt = Date()
+        if generation == startGeneration || cache == nil {
+            cache = snapshot
+            cacheLoadedAt = Date()
+        }
     }
 
     // MARK: - Database Persistence (Internal)
 
-    private func getRaw(key: String) async throws -> String? {
+    func getRaw(key: String) async throws -> String? {
         try await loadIfNeeded()
         return cache?[key]
     }
@@ -96,7 +110,8 @@ actor SettingsService {
     private func setRaw(key: String, value: String) async throws {
         try await loadIfNeeded()
 
-        let record = try await AppSetting.find(key, on: database) ?? AppSetting(key: key, value: value)
+        let record =
+            try await AppSetting.find(key, on: database) ?? AppSetting(key: key, value: value)
         record.value = value
         try await record.save(on: database)
 
@@ -107,7 +122,7 @@ actor SettingsService {
         try await publishInvalidation()
     }
 
-    private func deleteRaw(key: String) async throws {
+    func deleteRaw(key: String) async throws {
         try await loadIfNeeded()
 
         if let existing = try await AppSetting.find(key, on: database) {
@@ -121,42 +136,72 @@ actor SettingsService {
 
     // MARK: - Setting Resolution & Access
 
-    /// Resolves a dynamic setting by type descriptor, returning a `ManagedSetting<String>` wrapper.
+    /// Resolves a dynamic setting by type descriptor, returning a `ManagedSetting<String>` wrapper with raw unredacted value.
     func resolveAny(_ keyType: any AnySettingKey.Type) async throws -> ManagedSetting<String> {
-        if let envVal = keyType.envValue {
-            return ManagedSetting(value: envVal, isManagedByEnv: true)
-        }
-        if let dbStr = try await getRaw(key: keyType.key) {
-            return ManagedSetting(value: dbStr, isManagedByEnv: false)
-        }
-        return ManagedSetting(value: keyType.defaultValueString, isManagedByEnv: false)
+        try await loadIfNeeded()
+        return resolveMemory(keyType)
     }
 
     /// Resolves a setting with ENV precedence > DB > Default, returning a `ManagedSetting<K.Value>` wrapper.
     func resolve<K: SettingKey>(_ keyType: K.Type) async throws -> ManagedSetting<K.Value> {
         let raw = try await resolveAny(keyType)
-        let typedValue = K.Value(raw.value) ?? K.defaultValue
+        let typedValue = K.parse(raw.value) ?? K.defaultValue
         return ManagedSetting(value: typedValue, isManagedByEnv: raw.isManagedByEnv)
     }
 
-    /// Returns the effective strongly-typed value of a setting (ENV > DB > Default).
+    /// Returns the effective strongly-typed raw value of a setting (ENV > DB > Default).
     func get<K: SettingKey>(_ keyType: K.Type) async throws -> K.Value {
         try await resolve(keyType).value
     }
 
-    /// Resolves all registered settings as a dictionary `[key: ManagedSetting<String>]`.
-    func resolveAll() async throws -> [String: ManagedSetting<String>] {
+    /// Resolves a specific collection of setting key types in memory with zero intermediate actor hops.
+    func resolveKeys(_ keyTypes: [any AnySettingKey.Type]) async throws -> [String: ManagedSetting<String>] {
+        try await loadIfNeeded()
         var result: [String: ManagedSetting<String>] = [:]
-        for keyType in AppSettings.all {
-            result[keyType.key] = try await resolveAny(keyType)
+        result.reserveCapacity(keyTypes.count)
+        for keyType in keyTypes {
+            result[keyType.key] = resolveMemory(keyType)
         }
         return result
+    }
+
+    /// Resolves all registered settings as a dictionary `[key: ManagedSetting<String>]` with raw values.
+    func resolveAll() async throws -> [String: ManagedSetting<String>] {
+        try await resolveKeys(AppSettings.all)
+    }
+
+    /// Resolves settings belonging to a specific setting group.
+    func resolveGroup(_ group: SettingGroup) async throws -> [String: ManagedSetting<String>] {
+        try await resolveKeys(AppSettings.keys(for: group))
+    }
+
+    /// Resolves a specific set of keys by string identifier.
+    func resolveKeys(_ keys: Set<String>) async throws -> [String: ManagedSetting<String>] {
+        let matched = AppSettings.all.filter { keys.contains($0.key) }
+        return try await resolveKeys(matched)
+    }
+
+    /// Synchronous memory resolver. Precondition: `loadIfNeeded()` must have been called upfront.
+    private func resolveMemory(_ keyType: any AnySettingKey.Type) -> ManagedSetting<String> {
+        if let envVal = keyType.envValue {
+            return ManagedSetting(value: envVal, isManagedByEnv: true)
+        }
+        if let dbStr = cache?[keyType.key] {
+            return ManagedSetting(value: dbStr, isManagedByEnv: false)
+        }
+        return ManagedSetting(value: keyType.defaultValueString, isManagedByEnv: false)
     }
 
     // MARK: - Guarded Mutations
 
     /// Updates a dynamic setting by raw key and string value, throwing HTTP 409 Conflict if managed by an environment variable.
+    /// If the setting is `.secret` and the value is empty or whitespace-only, the existing value is preserved.
     func setGuardedAny(_ keyType: any AnySettingKey.Type, value rawValue: String) async throws {
+        // Safe Secret update: do not wipe an existing secret if the user submitted an empty/whitespace string
+        if keyType.isSecret && rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return
+        }
+
         let value = try keyType.validate(rawValue)
 
         if let envValue = keyType.envValue {
@@ -165,7 +210,8 @@ actor SettingsService {
             }
             throw Abort(
                 .conflict,
-                reason: "Setting '\(keyType.key)' is managed by an environment variable and cannot be changed via the web interface."
+                reason:
+                    "Setting '\(keyType.key)' is managed by an environment variable and cannot be changed via the web interface."
             )
         }
 
@@ -174,7 +220,7 @@ actor SettingsService {
 
     /// Updates a setting in the database, throwing HTTP 409 Conflict if managed by an environment variable.
     func setGuarded<K: SettingKey>(_ keyType: K.Type, value: K.Value) async throws {
-        try await setGuardedAny(keyType, value: String(describing: value))
+        try await setGuardedAny(keyType, value: K.serialize(value))
     }
 
     // MARK: - Cross-replica Cache Invalidation
@@ -215,7 +261,8 @@ actor SettingsService {
     private func publishInvalidation() async throws {
         do {
             _ = try await redis.publish(
-                invalidator.instanceID, to: SettingsCacheInvalidator.invalidationChannel).get()
+                invalidator.instanceID, to: SettingsCacheInvalidator.invalidationChannel
+            ).get()
         } catch {
             // Best-effort: the per-replica TTL is the backstop for a lost invalidation.
             logger.scoped(to: .system).warning(
@@ -225,7 +272,7 @@ actor SettingsService {
     }
 }
 
-// MARK: - Vapor Application Extension
+// MARK: - Vapor Application & Request Extensions
 
 extension Application {
     private struct SettingsServiceKey: StorageKey {
@@ -239,12 +286,19 @@ extension Application {
     var settings: SettingsService {
         get {
             guard let service = self.storage[SettingsServiceKey.self] else {
-                fatalError("SettingsService not configured. Call app.settings = ... in configure.swift")
+                fatalError(
+                    "SettingsService not configured. Call app.settings = ... in configure.swift")
             }
             return service
         }
         set {
             self.storage[SettingsServiceKey.self] = newValue
         }
+    }
+}
+
+extension Request {
+    var settings: SettingsService {
+        application.settings
     }
 }
